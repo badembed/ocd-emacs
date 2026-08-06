@@ -1,5 +1,10 @@
 import { Command } from "commander";
-import { resolveClient, closeSpawnedServer } from "./client";
+import {
+  resolveClient,
+  closeSpawnedServer,
+  abortActiveSession,
+  clearActiveAbort,
+} from "./client";
 import { resolveSession, listSessions } from "./sessions";
 import { assembleParts, resolveWorkspace } from "./context";
 import { streamResponse } from "./stream";
@@ -26,6 +31,23 @@ const opts = program.opts<{
   listSessions?: boolean;
 }>();
 const args: string[] = program.args;
+
+function onSignal(code: number): void {
+  try {
+    abortActiveSession();
+  } catch {
+    // ignore abort errors during shutdown
+  }
+  try {
+    closeSpawnedServer();
+  } catch {
+    // ignore kill errors during shutdown
+  }
+  process.exit(code);
+}
+
+process.on("SIGINT", () => onSignal(130));
+process.on("SIGTERM", () => onSignal(143));
 
 async function main(): Promise<number> {
   // 1. --list-sessions takes precedence (cwd workspace)
@@ -90,6 +112,7 @@ try {
   console.error("error:", msg);
   exitCode = 1;
 } finally {
+  clearActiveAbort();
   closeSpawnedServer();
 }
 

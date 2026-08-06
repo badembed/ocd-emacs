@@ -1,4 +1,5 @@
 import type { OpencodeClient, TextPartInput } from "@opencode-ai/sdk";
+import { setActiveAbort, clearActiveAbort } from "./client";
 
 const STREAM_TIMEOUT_MS = 120_000;
 
@@ -11,140 +12,177 @@ export async function streamResponse(
   sessionID: string,
   parts: TextPartInput[],
 ): Promise<void> {
-  // Subscribe BEFORE prompting to avoid missing early SSE events.
-  let sub: Awaited<ReturnType<OpencodeClient["event"]["subscribe"]>> | undefined;
-  try {
-    sub = await client.event.subscribe();
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(
-      `warning: event subscribe failed (${msg}), using batch mode`,
-    );
-    await batchPrompt(client, sessionID, parts);
-    return;
-  }
+  const controller = new AbortController();
+  const { signal } = controller;
 
-  try {
-    const result = await client.session.promptAsync({
-      path: { id: sessionID },
-      body: { parts },
-    });
-    if (result.error) {
-      throw new Error(String(result.error));
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(
-      `warning: promptAsync unavailable (${msg}), using batch mode`,
-    );
-    await batchPrompt(client, sessionID, parts);
-    return;
-  }
-
-  const seenText = new Map<string, string>();
-  let userMessageID: string | undefined;
-  let sawAssistantText = false;
-
-  const streamLoop = (async () => {
-    for await (const event of sub!.stream) {
-      switch (event.type) {
-        case "message.part.updated": {
-          const part = event.properties.part;
-          if (part.sessionID !== sessionID) break;
-
-          if (part.type === "text") {
-            if (userMessageID === undefined) {
-              userMessageID = part.messageID;
-            }
-            if (part.messageID === userMessageID) break;
-
-            const delta = event.properties.delta;
-            if (delta !== undefined && delta.length > 0) {
-              process.stdout.write(delta);
-              seenText.set(part.id, (seenText.get(part.id) ?? "") + delta);
-              sawAssistantText = true;
-            } else {
-              const prev = seenText.get(part.id) ?? "";
-              if (part.text.startsWith(prev)) {
-                const diff = part.text.slice(prev.length);
-                if (diff) {
-                  process.stdout.write(diff);
-                  sawAssistantText = true;
-                }
-                seenText.set(part.id, part.text);
-              } else if (part.text) {
-                process.stdout.write(part.text);
-                seenText.set(part.id, part.text);
-                sawAssistantText = true;
-              }
-            }
-          } else if (part.type === "tool") {
-            process.stderr.write(`[tool: ${part.tool}...]\n`);
-          }
-          break;
-        }
-        case "session.status": {
-          const props = event.properties;
-          if (props.sessionID === sessionID && props.status.type === "idle") {
-            return;
-          }
-          break;
-        }
-        case "session.idle": {
-          if (event.properties.sessionID === sessionID) {
-            return;
-          }
-          break;
-        }
-        case "session.error": {
-          const props = event.properties;
-          if (props.sessionID !== undefined && props.sessionID !== sessionID) {
-            break;
-          }
-          const errMsg =
-            props.error !== undefined
-              ? JSON.stringify(props.error)
-              : "unknown session error";
-          throw new Error(`OpenCode session error: ${errMsg}`);
-        }
-      }
-    }
-  })();
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(
-        new Error(
-          `timed out after ${STREAM_TIMEOUT_MS / 1000}s waiting for OpenCode response`,
-        ),
-      );
-    }, STREAM_TIMEOUT_MS);
+  setActiveAbort(() => {
+    if (!signal.aborted) controller.abort();
+    void client.session.abort({ path: { id: sessionID } }).catch(() => {});
   });
 
   try {
-    await Promise.race([streamLoop, timeout]);
-    process.stdout.write("\n");
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("timed out")) {
-      if (!sawAssistantText) {
-        await flushSessionText(client, sessionID);
-      } else {
-        process.stdout.write("\n");
-      }
-      throw new Error(
-        `${msg}\n` +
-          `OpenCode stayed busy (title/model call often hangs). ` +
-          `Retry, or point OCD_SERVER_URL at a running \`opencode serve\`.`,
+    // Subscribe BEFORE prompting to avoid missing early SSE events.
+    let sub: Awaited<ReturnType<OpencodeClient["event"]["subscribe"]>> | undefined;
+    try {
+      sub = await client.event.subscribe({
+        signal,
+      } as Parameters<OpencodeClient["event"]["subscribe"]>[0]);
+    } catch (err: unknown) {
+      if (signal.aborted) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `warning: event subscribe failed (${msg}), using batch mode`,
       );
+      await batchPrompt(client, sessionID, parts);
+      return;
     }
-    if (msg.startsWith("OpenCode session error:")) {
-      throw err instanceof Error ? err : new Error(msg);
+
+    let promptSent = false;
+    try {
+      const result = await client.session.promptAsync({
+        path: { id: sessionID },
+        body: { parts },
+      });
+      if (result.error) {
+        throw new Error(String(result.error));
+      }
+      promptSent = true;
+    } catch (err: unknown) {
+      if (signal.aborted) throw err;
+      if (!promptSent) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `warning: promptAsync unavailable (${msg}), using batch mode`,
+        );
+        await batchPrompt(client, sessionID, parts);
+        return;
+      }
+      throw err instanceof Error ? err : new Error(String(err));
     }
-    throw new Error(`stream error: ${msg}`);
+
+    const seenText = new Map<string, string>();
+    const roles = new Map<string, "user" | "assistant">();
+    let sawAssistantText = false;
+
+    const streamLoop = (async () => {
+      for await (const event of sub!.stream) {
+        if (signal.aborted) return;
+
+        switch (event.type) {
+          case "message.updated": {
+            const info = event.properties.info;
+            if (info.sessionID !== sessionID) break;
+            if (info.role === "user" || info.role === "assistant") {
+              roles.set(info.id, info.role);
+            }
+            break;
+          }
+          case "message.part.updated": {
+            const part = event.properties.part;
+            if (part.sessionID !== sessionID) break;
+
+            if (part.type === "text") {
+              if (roles.get(part.messageID) !== "assistant") break;
+              if (part.synthetic === true || part.ignored === true) break;
+
+              const delta = event.properties.delta;
+              if (delta !== undefined && delta.length > 0) {
+                process.stdout.write(delta);
+                seenText.set(part.id, (seenText.get(part.id) ?? "") + delta);
+                sawAssistantText = true;
+              } else {
+                const prev = seenText.get(part.id) ?? "";
+                if (part.text.startsWith(prev)) {
+                  const diff = part.text.slice(prev.length);
+                  if (diff) {
+                    process.stdout.write(diff);
+                    sawAssistantText = true;
+                  }
+                  seenText.set(part.id, part.text);
+                } else if (part.text) {
+                  process.stdout.write(part.text);
+                  seenText.set(part.id, part.text);
+                  sawAssistantText = true;
+                }
+              }
+            } else if (part.type === "tool") {
+              process.stderr.write(`[tool: ${part.tool}...]\n`);
+            }
+            break;
+          }
+          case "session.status": {
+            const props = event.properties;
+            if (props.sessionID === sessionID && props.status.type === "idle") {
+              return;
+            }
+            break;
+          }
+          case "session.idle": {
+            if (event.properties.sessionID === sessionID) {
+              return;
+            }
+            break;
+          }
+          case "session.error": {
+            const props = event.properties;
+            if (
+              props.sessionID !== undefined &&
+              props.sessionID !== sessionID
+            ) {
+              break;
+            }
+            const errMsg =
+              props.error !== undefined
+                ? JSON.stringify(props.error)
+                : "unknown session error";
+            throw new Error(`OpenCode session error: ${errMsg}`);
+          }
+        }
+      }
+    })();
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `timed out after ${STREAM_TIMEOUT_MS / 1000}s waiting for OpenCode response`,
+          ),
+        );
+      }, STREAM_TIMEOUT_MS);
+    });
+
+    try {
+      await Promise.race([streamLoop, timeout]);
+      process.stdout.write("\n");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("timed out")) {
+        if (!signal.aborted) controller.abort();
+        await client.session
+          .abort({ path: { id: sessionID } })
+          .catch(() => {});
+        if (!sawAssistantText) {
+          await flushSessionText(client, sessionID);
+        } else {
+          process.stdout.write("\n");
+        }
+        throw new Error(
+          `${msg}\n` +
+            `OpenCode stayed busy (title/model call often hangs). ` +
+            `Retry, or point OCD_SERVER_URL at a running \`opencode serve\`.`,
+        );
+      }
+      if (msg.startsWith("OpenCode session error:")) {
+        throw err instanceof Error ? err : new Error(msg);
+      }
+      throw new Error(`stream error: ${msg}`);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (!signal.aborted) controller.abort();
+    }
   } finally {
-    if (timer) clearTimeout(timer);
+    clearActiveAbort();
   }
 }
 

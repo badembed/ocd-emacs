@@ -6,12 +6,56 @@ import nodePath from "node:path";
 
 /** Module-level handle for auto-spawned server — closed on exit. */
 let spawnedServer: { close(): void } | undefined;
+/** Pid of auto-spawned serve — set at spawn time (before "listening"). */
+let spawnedPid: number | undefined;
+
+/** Active stream abort hook (session.abort + AbortController). */
+let activeAbort: (() => void) | undefined;
+
+function killPid(pid: number | undefined): void {
+  if (pid === undefined || !Number.isFinite(pid) || pid <= 0) return;
+  for (const sig of ["SIGTERM", "SIGKILL"] as const) {
+    try {
+      process.kill(pid, sig);
+    } catch {
+      // already gone
+    }
+  }
+}
 
 /** Close the auto-spawned OpenCode server if one was started. */
 export function closeSpawnedServer(): void {
   if (spawnedServer) {
-    spawnedServer.close();
+    try {
+      spawnedServer.close();
+    } catch {
+      // ignore
+    }
     spawnedServer = undefined;
+  }
+  killPid(spawnedPid);
+  spawnedPid = undefined;
+}
+
+/** Register cleanup for the in-flight stream (called on SIGINT/timeout). */
+export function setActiveAbort(fn: () => void): void {
+  activeAbort = fn;
+}
+
+export function clearActiveAbort(): void {
+  activeAbort = undefined;
+}
+
+/** Abort the active stream/session if any. */
+export function abortActiveSession(): void {
+  const fn = activeAbort;
+  activeAbort = undefined;
+  if (fn) {
+    try {
+      fn();
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -62,6 +106,7 @@ export async function resolveClient(
         timeout: 15_000,
       });
       spawnedServer = result.server;
+      spawnedPid = undefined;
       return createOpencodeClient({
         baseUrl: result.server.url,
         directory,
@@ -109,12 +154,20 @@ function spawnPureServer(directory: string): Promise<OpencodeClient> {
       },
     );
 
+    // Set immediately — child may appear in ps before "listening" is parsed.
+    spawnedPid = proc.pid;
+
+    const killProc = (): void => {
+      killPid(proc.pid ?? spawnedPid);
+    };
+
     let output = "";
     let settled = false;
     const timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
-      proc.kill();
+      killProc();
+      spawnedPid = undefined;
       reject(
         new Error(
           `Timeout waiting for opencode serve --pure\n${output.slice(-500)}`,
@@ -132,13 +185,11 @@ function spawnPureServer(directory: string): Promise<OpencodeClient> {
       settled = true;
       clearTimeout(timeout);
       const url = match[1].replace(/[.,;]+$/, "");
-      spawnedServer = {
-        close() {
-          proc.kill();
-        },
-      };
+      spawnedPid = proc.pid ?? spawnedPid;
+      spawnedServer = { close: killProc };
       void connect(url, directory).then(resolve, (err: unknown) => {
-        proc.kill();
+        killProc();
+        spawnedPid = undefined;
         reject(err);
       });
     };
@@ -149,12 +200,14 @@ function spawnPureServer(directory: string): Promise<OpencodeClient> {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      spawnedPid = undefined;
       reject(err);
     });
     proc.on("exit", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      spawnedPid = undefined;
       reject(
         new Error(
           `opencode serve exited with code ${code}\n${output.slice(-500)}`,
