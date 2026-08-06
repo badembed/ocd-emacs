@@ -1,11 +1,18 @@
 import type { OpencodeClient, TextPartInput } from "@opencode-ai/sdk";
 import { setActiveAbort, clearActiveAbort } from "./client";
+import {
+  handlePermission,
+  normalizePermissionEvent,
+  type PermissionMode,
+} from "./permissions";
 
 const STREAM_TIMEOUT_MS = 120_000;
 
 export type StreamOptions = {
   /** Log reasoning + tool calls to stderr (`-v` / `OCD_VERBOSE`). */
   verbose?: boolean;
+  /** How to answer OpenCode permission.updated prompts. */
+  permissionMode?: PermissionMode;
 };
 
 /**
@@ -19,6 +26,8 @@ export async function streamResponse(
   options: StreamOptions = {},
 ): Promise<void> {
   const verbose = options.verbose === true;
+  const permissionMode: PermissionMode =
+    options.permissionMode ?? "reject";
   const controller = new AbortController();
   const { signal } = controller;
 
@@ -77,8 +86,30 @@ export async function streamResponse(
     /** Tool parts that already logged a start / end line (dedupe SSE updates). */
     const toolStarted = new Set<string>();
     const toolFinished = new Set<string>();
+    const answeredPermissions = new Set<string>();
     let sawAssistantText = false;
     let reasoningOpen = false;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rejectTimeout: ((err: Error) => void) | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      rejectTimeout = reject;
+    });
+    const armTimeout = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        rejectTimeout?.(
+          new Error(
+            `timed out after ${STREAM_TIMEOUT_MS / 1000}s waiting for OpenCode response`,
+          ),
+        );
+      }, STREAM_TIMEOUT_MS);
+    };
+    const pauseTimeout = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    };
+    armTimeout();
 
     const isUserMessage = (messageID: string): boolean =>
       roles.get(messageID) === "user";
@@ -130,6 +161,33 @@ export async function streamResponse(
             }
           }
           continue;
+        }
+
+        // permission.asked (current) / permission.updated (SDK 1.18 types)
+        {
+          const et = (event as { type: string }).type;
+          if (et === "permission.asked" || et === "permission.updated") {
+            const perm = normalizePermissionEvent(
+              et,
+              (event as { properties: unknown }).properties,
+            );
+            if (perm && perm.sessionID === sessionID) {
+              pauseTimeout();
+              try {
+                await handlePermission({
+                  client,
+                  sessionID,
+                  perm,
+                  mode: permissionMode,
+                  signal,
+                  answered: answeredPermissions,
+                });
+              } finally {
+                if (!signal.aborted) armTimeout();
+              }
+            }
+            continue;
+          }
         }
 
         switch (event.type) {
@@ -261,17 +319,6 @@ export async function streamResponse(
         }
       }
     })();
-
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        reject(
-          new Error(
-            `timed out after ${STREAM_TIMEOUT_MS / 1000}s waiting for OpenCode response`,
-          ),
-        );
-      }, STREAM_TIMEOUT_MS);
-    });
 
     try {
       await Promise.race([streamLoop, timeout]);

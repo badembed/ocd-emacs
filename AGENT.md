@@ -14,10 +14,11 @@ ocd -p "объясни"                        # текст из буфера о
 ocd -s auth "продолжи"                  # именованная сессия (создать/возобновить)
 ocd -l                                  # список именованных сессий
 ocd -v "вопрос"                         # + reasoning и tool-вызовы в stderr
+ocd --auto "вопрос"                     # auto-approve permissions (once)
 ocd -s auth -p file.ts "всё вместе"     # комбинации
 ```
 
-**Что НЕ делает** (осознанно): TUI, интерактивный режим, multi-turn в одном вызове, Windows, флаги `--model`/`--agent`/`--command`. Один вопрос → один ответ. Сессии нужны для контекста между вызовами, не для диалога.
+**Что НЕ делает** (осознанно): TUI, multi-turn в одном вызове, Windows, флаги `--model`/`--agent`/`--command`. Один вопрос → один ответ. Сессии нужны для контекста между вызовами, не для диалога. Permission-ask в TTY обрабатывается (`y`/`a`/`n`); полный interactive agent — нет.
 
 ## Ключевые решения
 
@@ -52,7 +53,8 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
 | `client.ts` | ~298 | `resolveClient`, daemon/ephemeral spawn, abort hooks | T4 |
 | `sessions.ts` | ~144 | `readMapping`, `writeMapping`, `resolveSession`, `listSessions` | T5 |
 | `context.ts` | ~137 | `resolveWorkspace`, `assembleParts` | T6 |
-| `stream.ts` | ~273 | `streamResponse` (+ delta/role race, flush) | T7 |
+| `stream.ts` | ~290 | `streamResponse` (+ delta/role, permissions, flush) | T7 |
+| `permissions.ts` | ~180 | mode, TTY prompt, SDK reply | permissions |
 
 Порядок в `main()`: args → list-sessions → validate question → **resolveWorkspace + assembleParts** → client → session → stream. Context собирается до connect/spawn, чтобы bad path не поднимал сервер.
 
@@ -69,6 +71,7 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
 - Эхо-фильтр: пропускаем только известные `user` messages; неизвестный role + text parts печатаем (иначе пустой stdout).
 - Контекст: папка → OpenCode `directory`; файл → `directory` = parent + гибрид (≤4KB inline / path-only).
 - Tool/reasoning в stderr только при `-v` или `OCD_VERBOSE=1|true` (ответ — stdout). Tools: start+args, done+output (усечённо), error.
+- Permissions: OpenCode emits `permission.asked` (legacy: `permission.updated`). TTY → stderr `[y]`/`[a]`/`[n]`; `--auto`/`OCD_AUTO` → `once`; non-TTY без auto → `reject`. Пока ждём ответ, stream timeout на паузе.
 
 ## Что сделано (10/11 задач + пост-фиксы; T11 отложен)
 
@@ -124,6 +127,7 @@ bunx tsc --noEmit                 # проверка типов
 8. Ответ непустой, не error
 9. `-l` / `--list-sessions` → таблица name/id/messages/updated
 10. Без `-v` reasoning/tool в stderr нет; с `-v` / `OCD_VERBOSE=1` — есть (stdout чистый)
+11. Permission ask: TTY → y/a/n; `--auto` → once; non-TTY без auto → reject + warning
 
 **Процессы OpenCode после запуска:**
 ```bash
@@ -151,6 +155,7 @@ lsof -nP -iTCP:4097 -sTCP:LISTEN   # должен быть один listener
 | `OCD_SERVER_URL` | Явный сервер; при ошибке — fail, без auto-start |
 | `OPENCODE_BIN_PATH` | Путь к бинарнику `opencode` |
 | `OCD_VERBOSE` | `1` / `true` — reasoning + tool-вызовы в stderr (как `-v`) |
+| `OCD_AUTO` | `1` / `true` — auto-approve permissions (`once`, как `--auto`) |
 
 ## Правила работы с этим кодом
 

@@ -8,6 +8,7 @@ import {
 import { resolveSession, listSessions } from "./sessions";
 import { assembleParts, resolveWorkspace } from "./context";
 import { streamResponse } from "./stream";
+import { resolvePermissionMode } from "./permissions";
 
 const program = new Command();
 
@@ -22,6 +23,10 @@ program
   .option("-p, --paste", "include clipboard content")
   .option("-s, --session <name>", "named session to use or create")
   .option("-v, --verbose", "log reasoning and tool calls to stderr")
+  .option(
+    "--auto",
+    "auto-approve OpenCode permissions (once), like opencode run --auto",
+  )
   .option("-l, --list-sessions", "list named sessions");
 
 program.parse();
@@ -30,6 +35,7 @@ const opts = program.opts<{
   paste?: boolean;
   session?: string;
   verbose?: boolean;
+  auto?: boolean;
   listSessions?: boolean;
 }>();
 const args: string[] = program.args;
@@ -106,7 +112,10 @@ async function main(): Promise<number> {
     opts.verbose === true ||
     process.env.OCD_VERBOSE === "1" ||
     process.env.OCD_VERBOSE === "true";
-  await streamResponse(client, sessionID, parts, { verbose });
+  const permissionMode = resolvePermissionMode({
+    autoFlag: opts.auto === true,
+  });
+  await streamResponse(client, sessionID, parts, { verbose, permissionMode });
   return 0;
 }
 
