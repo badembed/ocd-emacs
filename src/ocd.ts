@@ -52,21 +52,24 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  // 4. Resolve client
+  // 4. Assemble parts early — fail on bad path/clipboard before spawning server
+  const parts = assembleParts(path, question, opts.paste === true);
+
+  // 5. Resolve client
   const client = await resolveClient();
 
-  // 5. Resolve or create session
+  // 6. Resolve or create session
   const sessionID = opts.session
     ? await resolveSession(client, opts.session)
-    : await client.session.create({ body: {} }).then((r) => {
-        if (r.error) {
-          throw new Error(`failed to create session: ${String(r.error)}`);
+    : await (async () => {
+        const created = await client.session.create({ body: {} });
+        if (created.error) {
+          throw new Error(`failed to create session: ${String(created.error)}`);
         }
-        return r.data!.id;
-      });
+        return created.data!.id;
+      })();
 
-  // 6. Assemble context parts and stream response
-  const parts = assembleParts(path, question, opts.paste === true);
+  // 7. Stream response
   await streamResponse(client, sessionID, parts);
   return 0;
 }
