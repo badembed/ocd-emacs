@@ -8,11 +8,12 @@
 
 ```bash
 ocd "что такое 2+2?"                    # простой вопрос
-ocd file.ts "отрефактори"               # файл как контекст
-ocd folder/ "что здесь?"                # листинг папки как контекст
+ocd file.ts "отрефактори"               # файл как контекст (parent = workspace)
+ocd folder/ "что здесь?"                # папка = OpenCode working directory
 ocd -p "объясни"                        # текст из буфера обмена
 ocd -s auth "продолжи"                  # именованная сессия (создать/возобновить)
-ocd --list-sessions                     # список именованных сессий
+ocd -l                                  # список именованных сессий
+ocd -v "вопрос"                         # + tool-вызовы в stderr
 ocd -s auth -p file.ts "всё вместе"     # комбинации
 ```
 
@@ -26,75 +27,78 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
 | `bun build --compile` | Нативный бинарник, не требует Node.js у пользователя |
 | Именованные сессии (`-s name`) | Не нужно помнить/копировать `ses_...` ID; маппинг в `~/.ocd/sessions.json` |
 | Реальный стриминг через SSE | Символы появляются по мере генерации (не batch) |
-| Дефолт `http://127.0.0.1:4097` (+ `OCD_SERVER_URL`) | Быстрый connect к своему pure-serve; 4096 не трогаем |
+| Дефолт `http://127.0.0.1:4097` (+ `OCD_SERVER_URL`) | Свой pure-serve; порт 4096 (TUI/IDE) не трогаем |
+| Persistent daemon на первом запуске | Cold start один раз; дальше быстрый connect |
+| Гибрид файлов (≤4KB inline) | Малые файлы в prompt; большие — path + hint для tools |
+| Папка = `directory`, не listing | OpenCode сам видит workspace; в prompt листинг не кладём |
 | `clipboardy` | Кроссплатформенный доступ к буферу обмена |
-| Модули вместо одного файла | F2: каждый файл <300 строк (было 465 в монолите) |
-| Agent-executed QA, без юнит-тестов | Каждый сценарий проверяется запуском реального бинарника |
+| Модули вместо одного файла | Читаемость; бюджет ~300 LOC/файл желателен, не жёсткий |
+| Agent-executed QA, без юнит-тестов | Каждый сценарий — запуском реального бинарника |
 
 ## Поиск OpenCode (порядок приоритета)
 
 1. `OCD_SERVER_URL` или дефолт `http://127.0.0.1:4097` → connect + probe `session.list()`
-2. Если дефолт мёртв → **один раз** поднять persistent `opencode serve --hostname=127.0.0.1 --port=4097 --pure` (detached, не убиваем при выходе `ocd`)
-3. Явный `OCD_SERVER_URL` при ошибке → fail
-4. Last resort → ephemeral `--pure` на port 0 (убивается при выходе)
+2. Если дефолт мёртв → **один раз** поднять persistent `opencode serve --hostname=127.0.0.1 --port=4097 --pure` (detached, **не** убиваем при выходе `ocd`)
+3. Явный `OCD_SERVER_URL` при ошибке → fail (без автостарта)
+4. Last resort → ephemeral `--pure` на port 0 (**убивается** при выходе)
 
-Рекомендуемый быстрый режим после первого запуска: daemon уже на `:4097`.
+После первого успешного запуска daemon на `:4097` остаётся жить — это нормально.
 
 ## Структура `src/`
 
 | Файл | Строк | Функции | Задача |
 |---|---|---|---|
-| `ocd.ts` | ~88 | `main()` + commander | T3, T8 |
-| `client.ts` | ~65 | `resolveClient`, `closeSpawnedServer` | T4 |
+| `ocd.ts` | ~119 | `main()` + commander | T3, T8 |
+| `client.ts` | ~298 | `resolveClient`, daemon/ephemeral spawn, abort hooks | T4 |
 | `sessions.ts` | ~144 | `readMapping`, `writeMapping`, `resolveSession`, `listSessions` | T5 |
-| `context.ts` | ~74 | `assembleParts` | T6 |
-| `stream.ts` | ~100 | `streamResponse` | T7 |
+| `context.ts` | ~137 | `resolveWorkspace`, `assembleParts` | T6 |
+| `stream.ts` | ~273 | `streamResponse` (+ delta/role race, flush) | T7 |
 
-Порядок в `main()`: args → list-sessions → validate question → **assembleParts** → client → session → stream. Context собирается до спавна сервера, чтобы bad path не оставлял orphans.
+Порядок в `main()`: args → list-sessions → validate question → **resolveWorkspace + assembleParts** → client → session → stream. Context собирается до connect/spawn, чтобы bad path не поднимал сервер.
 
-## Критичные SDK-факты (проверено по установленному пакету)
+## Критичные SDK-факты
 
-- `createOpencode(options?: ServerOptions)` → `{ client, server: { url, close() } }` — спавнит `opencode serve --hostname=X --port=Y`, ждёт строку `opencode server listening on <url>`.
-- `createOpencodeClient({ baseUrl, directory })` — **ленивый** fetch-клиент: ошибка соединения только на первом вызове API.
-- `client.session.promptAsync({ path: { id }, body: { parts } })` — fire-and-forget; текст приходит через SSE.
-- `client.event.subscribe()` → `{ stream: AsyncGenerator }`. События:
-  - `message.part.updated` → `{ part: TextPart|ToolPart, delta?: string }` — дельты текста ассистента;
-  - `session.status` → `{ status: { type: "idle" } }` — завершение обработки.
-- Типы: `TextPartInput = { type: "text", text }`; `FilePartInput` требует URL — **не используется**, контекст всегда TextPartInput.
-- Контекст: папка → OpenCode `directory` (workspace), без листинга в prompt; файл → `directory` = parent + гибрид содержимого (≤4KB inline, больше → path-only).
-- Эхо-фильтр: первый message (вопрос пользователя) НЕ выводится; стримим только текст ассистента по `delta`.
+- `createOpencode(options?)` → `{ client, server: { url, close() } }` — ephemeral serve; для `:4097` мы спавним `opencode serve --pure` сами.
+- `createOpencodeClient({ baseUrl, directory })` — ленивый клиент; ошибка только на первом API-вызове.
+- `client.session.promptAsync(...)` — fire-and-forget; текст через SSE.
+- `client.event.subscribe()` → `{ stream }`. Важные события:
+  - `message.updated` — `role` (`user`/`assistant`); часто **после** текста ассистента;
+  - `message.part.updated` — part + опциональный `delta`;
+  - `message.part.delta` — `{ sessionID, messageID, partID, field, delta }` (в SDK 1.18 типов может не быть — обрабатываем runtime);
+  - `session.status` / `session.idle` — завершение.
+- Эхо-фильтр: пропускаем только известные `user` messages; неизвестный role + text parts печатаем (иначе пустой stdout).
+- Контекст: папка → OpenCode `directory`; файл → `directory` = parent + гибрид (≤4KB inline / path-only).
+- Tool noise в stderr только при `-v` или `OCD_VERBOSE=1|true`.
 
-## Что сделано (10/11 задач + фиксы; T11 отложен)
+## Что сделано (10/11 задач + пост-фиксы; T11 отложен)
 
 | Задача | Коммит | Содержимое | Верификация |
 |---|---|---|---|
-| T1 package.json | `f5d342b` | deps, скрипты build | ✓ |
-| T2 tsconfig.json | `2f0056b` | strict TS | ✓ |
-| T3 CLI skeleton | `7369b1c` | commander-парсинг | ✓ |
-| T4 client resolver | `a88b9c7` | 3-уровневый discovery | ✓ |
-| T5 session manager | `10a7786` | `~/.ocd/sessions.json`, mode 600 | ✓ |
-| T6 context assembly | `82e2f23` | clipboard → file/folder → question | ✓ |
-| фикс orphans | `871f328` | `exitCode` + exit после finally | ✓ |
-| T7 streaming | `c79c895` | promptAsync + SSE | ✓ |
-| T8 main integration | `845a518` | `main()`, модули <300 LOC | ✓ |
-| T9 build | `445a70e` | 4 target + `install.sh` | ✓ |
-| фикс early assemble | `20671e7` | parts до spawn сервера | ✓ |
-| T10 QA macOS | `564beb4` | smoke (a)-(g) на darwin-arm64 | ✓ |
-| **T11 QA Linux** | — | **отложено**: пользователь прогонит на Linux/Docker сам | ⏭ |
+| T1–T10 | см. историю | core CLI, build, macOS QA | ✓ |
+| фикс hang headless | `498ab54` | `--pure`, title, SSE до prompt, timeout | ✓ |
+| hybrid files | `85c8392` / `f30764b` | inline ≤4KB | ✓ |
+| workspace directory | `e499ad9` | папка/файл → OpenCode `directory` | ✓ |
+| abort / SIGINT / role filter | `2d65317` | cleanup + assistant filter | ✓ |
+| default `:4097` | `bfce60b` | `DEFAULT_SERVER_URL` | ✓ |
+| persistent daemon | `921a2a0` | auto-start `--pure` на 4097 | ✓ |
+| empty SSE text | `f97486e` | late role + `message.part.delta` + flush | ✓ |
+| **T11 QA Linux** | — | **отложено**: пользователь прогонит сам | ⏭ |
 
 ### Final verification (F1–F4)
 
 | Check | Статус | Notes |
 |---|---|---|
-| F1 Scope IN | ✓ | все паттерны + install.sh; Scope OUT отсутствует |
-| F2 Code quality | ✓ | модули, max 144 строк/файл, нет `any`/`@ts-ignore`, `tsc --noEmit` ok |
-| F3 Cross-platform | ✓ | 4 бинарника в `dist/`; darwin `--help` ok; linux ELF present |
-| F4 Edge cases | ✓ | nonexistent/empty/binary → exit 1; bad `OPENCODE_BIN_PATH` → exit 1; `~/.ocd` mode 700 / sessions.json mode 600; empty clipboard → warning |
+| F1 Scope IN | ✓ | паттерны + install.sh; Scope OUT отсутствует |
+| F2 Code quality | ✓ | модули, нет `any`/`@ts-ignore`, `tsc --noEmit` ok |
+| F3 Cross-platform | ✓ | 4 бинарника в `dist/` |
+| F4 Edge cases | ✓ | bad path/empty/binary/OPENCODE_BIN_PATH; `~/.ocd` 700 / sessions 600 |
 
 ### Найденные и исправленные баги
 
-1. **Утечка `opencode serve`** (T6): `process.exit(1)` внутри `catch` блокировал `finally`. Фикс: `exitCode` + exit после finally. **Правило: никогда не вызывать `process.exit` внутри try/catch до finally.**
-2. **Спавн сервера на bad path** (T10): `assembleParts` шёл после `resolveClient` → orphan на nonexistent file. Фикс: собирать parts до spawn.
+1. **Утечка `opencode serve`** (ephemeral): `process.exit` до `finally` блокировал cleanup. **Правило: не вызывать `process.exit` внутри try/catch до finally.**
+2. **Спавн на bad path**: parts после client → orphan. Фикс: assemble до connect.
+3. **Hang на headless**: OhMyOpenCode / title-agent. Фикс: `--pure` + session title + timeout/abort.
+4. **Пустой stdout**: `role=assistant` приходит после текста; `message.part.delta` игнорировался. Фикс: `f97486e`.
 
 ## Как запускать и проверять
 
@@ -118,11 +122,15 @@ bunx tsc --noEmit                 # проверка типов
 6. `-s <ses_...>` прямой ID → используется как есть
 7. `-p` без буфера → warning, вопрос без clipboard
 8. Ответ непустой, не error
-9. `--list-sessions` → таблица name/id/messages/updated
+9. `-l` / `--list-sessions` → таблица name/id/messages/updated
+10. Без `-v` tool-строки в stderr нет; с `-v` / `OCD_VERBOSE=1` — есть
 
-**Проверка отсутствия утечек после каждого запуска:**
+**Процессы OpenCode после запуска:**
 ```bash
-pgrep -fl "opencode serve"   # должно быть пусто (или только внешний сервер)
+pgrep -fl "opencode serve"
+# Ожидаемо: persistent daemon на :4097 (после первого auto-start) — OK
+# Неожиданно: лишние ephemeral serve (port=0) после выхода ocd — баг
+lsof -nP -iTCP:4097 -sTCP:LISTEN   # должен быть один listener
 ```
 
 ## Артефакты проекта
@@ -136,11 +144,20 @@ pgrep -fl "opencode serve"   # должно быть пусто (или толь
 | `install.sh` | Установка бинарника в `~/.local/bin/ocd` |
 | `~/.ocd/sessions.json` | Маппинг имя → sessionID (mode 600) |
 
+## Env
+
+| Переменная | Смысл |
+|---|---|
+| `OCD_SERVER_URL` | Явный сервер; при ошибке — fail, без auto-start |
+| `OPENCODE_BIN_PATH` | Путь к бинарнику `opencode` |
+| `OCD_VERBOSE` | `1` / `true` — tool-вызовы в stderr (как `-v`) |
+
 ## Правила работы с этим кодом
 
-1. **Не вызывать `process.exit()` внутри try/catch до `finally`** — блокирует cleanup (см. баг 871f328).
+1. **Не вызывать `process.exit()` внутри try/catch до `finally`** — блокирует cleanup.
 2. Ошибки → человекочитаемое сообщение в stderr + exit code ≠ 0, без stack trace для ожидаемых ошибок.
 3. Строгий tsconfig: никаких `any`, `@ts-ignore`, `@ts-expect-error`.
 4. Стейт пользователя — только в `~/.ocd/`, репозиторий не содержит ничего пользовательского.
-5. После каждой задачи: один Conventional-коммит (`feat:`/`fix:`/`chore:`/`build:`/`test:`), только файлы задачи, `.omo/` не коммитить.
-6. QA — запуском реального бинарника/скрипта против реального OpenCode; после каждого запуска проверять отсутствие orphan-процессов.
+5. После каждой задачи: один Conventional-коммит, только файлы задачи, `.omo/` не коммитить.
+6. QA — реальным бинарником против реального OpenCode; ephemeral orphans недопустимы; persistent `:4097` — ожидаем.
+7. Persistent daemon на `:4097` не убивать из `closeSpawnedServer()`.

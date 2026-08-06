@@ -3,6 +3,11 @@ import { setActiveAbort, clearActiveAbort } from "./client";
 
 const STREAM_TIMEOUT_MS = 120_000;
 
+export type StreamOptions = {
+  /** Log tool calls to stderr (`-v` / `OCD_VERBOSE`). */
+  verbose?: boolean;
+};
+
 /**
  * Send a prompt via `promptAsync` and stream the answer to stdout via SSE.
  * Falls back to batch `prompt()` if promptAsync is unavailable.
@@ -11,7 +16,9 @@ export async function streamResponse(
   client: OpencodeClient,
   sessionID: string,
   parts: TextPartInput[],
+  options: StreamOptions = {},
 ): Promise<void> {
+  const verbose = options.verbose === true;
   const controller = new AbortController();
   const { signal } = controller;
 
@@ -138,7 +145,7 @@ export async function streamResponse(
                   sawAssistantText = true;
                 }
               }
-            } else if (part.type === "tool") {
+            } else if (part.type === "tool" && verbose) {
               process.stderr.write(`[tool: ${part.tool}...]\n`);
             }
             break;

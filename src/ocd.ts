@@ -21,13 +21,15 @@ program
   .argument("[question]", "question to ask")
   .option("-p, --paste", "include clipboard content")
   .option("-s, --session <name>", "named session to use or create")
-  .option("--list-sessions", "list named sessions");
+  .option("-v, --verbose", "log tool calls to stderr")
+  .option("-l, --list-sessions", "list named sessions");
 
 program.parse();
 
 const opts = program.opts<{
   paste?: boolean;
   session?: string;
+  verbose?: boolean;
   listSessions?: boolean;
 }>();
 const args: string[] = program.args;
@@ -100,7 +102,11 @@ async function main(): Promise<number> {
       })();
 
   // 7. Stream response
-  await streamResponse(client, sessionID, parts);
+  const verbose =
+    opts.verbose === true ||
+    process.env.OCD_VERBOSE === "1" ||
+    process.env.OCD_VERBOSE === "true";
+  await streamResponse(client, sessionID, parts, { verbose });
   return 0;
 }
 
