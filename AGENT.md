@@ -28,6 +28,7 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
 | Реальный стриминг через SSE | Символы появляются по мере генерации (не batch) |
 | `OCD_SERVER_URL` в discovery | Совместимость с форком OpenCode пользователя |
 | `clipboardy` | Кроссплатформенный доступ к буферу обмена |
+| Модули вместо одного файла | F2: каждый файл <300 строк (было 465 в монолите) |
 | Agent-executed QA, без юнит-тестов | Каждый сценарий проверяется запуском реального бинарника |
 
 ## Поиск OpenCode (порядок приоритета)
@@ -36,15 +37,17 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
 2. `OPENCODE_BIN_PATH` → проверка существования файла, префикс dirname в `PATH`, авто-спавн (у `ServerOptions` НЕТ `binPath` — обрабатываем через PATH)
 3. дефолт → `createOpencode()` авто-спавн `opencode serve` (cross-spawn ищет в PATH)
 
-## Структура `src/ocd.ts` (465 строк, один файл)
+## Структура `src/`
 
-| Блок | Функции | Задача |
-|---|---|---|
-| Session store | `readMapping`, `writeMapping`, `resolveSession`, `listSessions` | T5 |
-| Client resolver | `resolveClient`, `closeSpawnedServer` (module-level `spawnedServer`) | T4 |
-| CLI parsing | `program` (commander): `[path] [question]`, `-p`, `-s`, `--list-sessions` | T3 |
-| Context assembly | `assembleParts` → `TextPartInput[]` (clipboard → file/folder → question) | T6 |
-| Streaming | `streamResponse`: `promptAsync` + `event.subscribe()` SSE, batch-fallback на `prompt()` | T7 |
+| Файл | Строк | Функции | Задача |
+|---|---|---|---|
+| `ocd.ts` | ~88 | `main()` + commander | T3, T8 |
+| `client.ts` | ~65 | `resolveClient`, `closeSpawnedServer` | T4 |
+| `sessions.ts` | ~144 | `readMapping`, `writeMapping`, `resolveSession`, `listSessions` | T5 |
+| `context.ts` | ~74 | `assembleParts` | T6 |
+| `stream.ts` | ~100 | `streamResponse` | T7 |
+
+Порядок в `main()`: args → list-sessions → validate question → **assembleParts** → client → session → stream. Context собирается до спавна сервера, чтобы bad path не оставлял orphans.
 
 ## Критичные SDK-факты (проверено по установленному пакету)
 
@@ -57,51 +60,52 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
 - Типы: `TextPartInput = { type: "text", text }`; `FilePartInput` требует URL — **не используется**, контекст всегда TextPartInput.
 - Эхо-фильтр: первый message (вопрос пользователя) НЕ выводится; стримим только текст ассистента по `delta`.
 
-## Что сделано (7/11 задач + 1 фикс)
+## Что сделано (10/11 задач + фиксы; T11 отложен)
 
 | Задача | Коммит | Содержимое | Верификация |
 |---|---|---|---|
-| T1 package.json | `f5d342b` | deps (`@opencode-ai/sdk`, `commander`, `clipboardy`, `@types/node`, `typescript`), скрипты `build`/`build:all`, `.gitignore` (node_modules/, dist/) | `bun install` ✓, `bun run build` → Mach-O бинарник ✓ |
-| T2 tsconfig.json | `2f0056b` | strict, ESNext, moduleResolution bundler, noUnusedLocals/Parameters | `tsc --noEmit` ✓, негатив: намеренная ошибка типов ловится ✓ |
-| T3 CLI skeleton | `7369b1c` | commander-парсинг, дизамбигуация path/question (один позиционный = вопрос) | 8 acceptance-сценариев ✓ |
-| T4 client resolver | `a88b9c7` | `resolveClient` 3-уровневый discovery, probe `session.list()`, `closeSpawnedServer` | A1-A5 ✓ (включая ошибки exit 1) |
-| T5 session manager | `10a7786` | `~/.ocd/sessions.json`, `resolveSession` (stale-восстановление, `ses_` passthrough), `listSessions` (console.table) | S1-S8 ✓ (stale mapping, corrupt JSON) |
-| T6 context assembly | `82e2f23` | `assembleParts`: clipboard → file/folder → question, бинарные файлы, ошибки | C1-C8 ✓ |
-| **фикс** | `871f328` | **Утечка сервера на error-путях**: `process.exit(1)` в catch блокировал `finally { closeSpawnedServer() }` → orphan `opencode serve` на порту 4096. Фикс: паттерн `exitCode` + exit после finally | C5/C6: exit 1 БЕЗ orphans ✓ |
-| T7 streaming | `c79c895` | `streamResponse`: promptAsync + SSE, эхо-фильтр, `[tool: ...]` в stderr, batch-fallback | S1-S8 ✓ (контекст сессии, MESSAGES=8 в листинге) |
+| T1 package.json | `f5d342b` | deps, скрипты build | ✓ |
+| T2 tsconfig.json | `2f0056b` | strict TS | ✓ |
+| T3 CLI skeleton | `7369b1c` | commander-парсинг | ✓ |
+| T4 client resolver | `a88b9c7` | 3-уровневый discovery | ✓ |
+| T5 session manager | `10a7786` | `~/.ocd/sessions.json`, mode 600 | ✓ |
+| T6 context assembly | `82e2f23` | clipboard → file/folder → question | ✓ |
+| фикс orphans | `871f328` | `exitCode` + exit после finally | ✓ |
+| T7 streaming | `c79c895` | promptAsync + SSE | ✓ |
+| T8 main integration | `845a518` | `main()`, модули <300 LOC | ✓ |
+| T9 build | `445a70e` | 4 target + `install.sh` | ✓ |
+| фикс early assemble | `20671e7` | parts до spawn сервера | ✓ |
+| T10 QA macOS | `564beb4` | smoke (a)-(g) на darwin-arm64 | ✓ |
+| **T11 QA Linux** | — | **отложено**: пользователь прогонит на Linux/Docker сам | ⏭ |
+
+### Final verification (F1–F4)
+
+| Check | Статус | Notes |
+|---|---|---|
+| F1 Scope IN | ✓ | все паттерны + install.sh; Scope OUT отсутствует |
+| F2 Code quality | ✓ | модули, max 144 строк/файл, нет `any`/`@ts-ignore`, `tsc --noEmit` ok |
+| F3 Cross-platform | ✓ | 4 бинарника в `dist/`; darwin `--help` ok; linux ELF present |
+| F4 Edge cases | ✓ | nonexistent/empty/binary → exit 1; bad `OPENCODE_BIN_PATH` → exit 1; `~/.ocd` mode 700 / sessions.json mode 600; empty clipboard → warning |
 
 ### Найденные и исправленные баги
 
-1. **Утечка `opencode serve`** (найдено при верификации T6): `process.exit(1)` внутри `catch` не давал выполниться `finally { closeSpawnedServer() }`. Исправлено в `871f328` заменой на `exitCode`-переменную. **Правило на будущее: никогда не вызывать `process.exit` внутри try/catch до finally.**
-
-## Что осталось
-
-### Wave 3 (сборка + QA)
-- [ ] **T8 Main integration** — собрать всё в `main()`: порядок (аргументы → list-sessions → валидация question → client → session → parts → stream), убрать debug-выводы. Требует: `question required` при пустом вопросе.
-- [ ] **T9 Build** — `bun build --compile` для 4 таргетов: `bun-darwin-arm64-modern`, `bun-darwin-x64-modern`, `bun-linux-x64-modern`, `bun-linux-arm64-modern`; скрипты `build:mac-arm`/`build:mac-x64`/`build:linux-x64`/`build:linux-arm64`/`build:all`; `dist/` уже в .gitignore.
-- [ ] **T10 QA macOS arm64** — smoke (a)-(g) на собранном бинарнике: базовый вопрос, файл, clipboard, сессия с запоминанием (42), повторный вопрос (контекст), list-sessions, ошибка.
-- [ ] **T11 QA Linux x64** — те же сценарии на Linux (Docker с bun), проверка `xclip`/`wl-paste`, права 600 на `~/.ocd/sessions.json`.
-
-### Final verification wave
-- [ ] **F1** Plan compliance: Scope IN покрыт, Scope OUT отсутствует.
-- [ ] **F2** Code quality: <300 строк (сейчас 465 — **нужно декомпозировать** или обосновать), нет `any`, ошибки обработаны.
-- [ ] **F3** Cross-platform: 4 бинарника в `dist/`, все проходят `--help`.
-- [ ] **F4** Edge cases: 7 сценариев (несуществующий файл, пустой вопрос, бинарный файл, пустой clipboard, OpenCode не найден, `~/.ocd` отсутствует, повреждённый sessions.json).
-
-> ⚠️ **F2 конфликт с планом**: план требовал один файл <300 строк, сейчас 465. При T8 либо вынести session-store/context/streaming в отдельные модули, либо согласовать с пользователем отклонение от лимита. План это не запрещает явно (в Scope IN один файл не зафиксирован), но F2 сформулирован как «один файл, <300 строк».
+1. **Утечка `opencode serve`** (T6): `process.exit(1)` внутри `catch` блокировал `finally`. Фикс: `exitCode` + exit после finally. **Правило: никогда не вызывать `process.exit` внутри try/catch до finally.**
+2. **Спавн сервера на bad path** (T10): `assembleParts` шёл после `resolveClient` → orphan на nonexistent file. Фикс: собирать parts до spawn.
 
 ## Как запускать и проверять
 
 ```bash
 cd /Users/alexantonov/sources/ocd
 bun install                       # зависимости
-bun run src/ocd.ts "вопрос"      # dev-режим (TypeScript напрямую)
-bun run build                     # собрать бинарник для текущей платформы
-./dist/ocd "вопрос"               # собранный бинарник
+bun run src/ocd.ts "вопрос"      # dev-режим
+bun run build                     # бинарник для текущей платформы
+bun run build:all                 # 4 кросс-платформенных бинарника
+./dist/ocd "вопрос"               # локальный бинарник
+./install.sh                      # копирует в ~/.local/bin/ocd
 bunx tsc --noEmit                 # проверка типов
 ```
 
-**Верификационные инварианты** (план):
+**Верификационные инварианты**:
 1. Без аргументов → help
 2. Несуществующий файл → stderr, exit ≠ 0
 3. Пустой вопрос → `question required`
@@ -121,12 +125,12 @@ pgrep -fl "opencode serve"   # должно быть пусто (или толь
 
 | Файл | Назначение |
 |---|---|
-| `.omo/plans/ocd-cli-wrapper.md` | Полный план: 11 задач, 3 волны + F1-F4, acceptance-критерии, коммит-стратегия |
-| `.omo/drafts/ocd-cli-wrapper.md` | Черновик с зафиксированными решениями (fork point) |
-| `.omo/boulder.json` | Состояние выполнения (active_work: ocd-cli-wrapper) |
-| `.omo/start-work/ledger.jsonl` | Журнал: DoneClaim + adversarial-классы + cleanup по каждой задаче |
-| `src/ocd.ts` | Весь CLI (465 строк) |
-| `~/.ocd/sessions.json` | Маппинг имя → sessionID (создаётся автоматически) |
+| `.omo/plans/ocd-cli-wrapper.md` | Полный план: 11 задач, 3 волны + F1-F4 |
+| `.omo/drafts/ocd-cli-wrapper.md` | Черновик с зафиксированными решениями |
+| `.omo/boulder.json` | Состояние выполнения |
+| `src/*.ts` | CLI (модули) |
+| `install.sh` | Установка бинарника в `~/.local/bin/ocd` |
+| `~/.ocd/sessions.json` | Маппинг имя → sessionID (mode 600) |
 
 ## Правила работы с этим кодом
 
