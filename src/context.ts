@@ -10,7 +10,7 @@ import type { TextPartInput } from "@opencode-ai/sdk";
 import clipboardy from "clipboardy";
 
 /** Files larger than this are sent as path + metadata, not full contents. */
-export const INLINE_MAX_BYTES = 64 * 1024;
+export const INLINE_MAX_BYTES = 4 * 1024;
 
 /**
  * Build prompt parts in order: clipboard → file/folder → question.
