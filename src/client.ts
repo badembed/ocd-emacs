@@ -59,22 +59,23 @@ export function abortActiveSession(): void {
   }
 }
 
+/** Default ocd-dedicated OpenCode serve (override with OCD_SERVER_URL). */
+export const DEFAULT_SERVER_URL = "http://127.0.0.1:4097";
+
 /**
- * Resolve an OpenCode client following env-based discovery:
- * 1. OCD_SERVER_URL  → connect to existing server
- * 2. OPENCODE_BIN_PATH → prepend dir to PATH
- * 3. Existing local serve on :4096 → reuse
- * 4. Auto-spawn `opencode serve --pure` on ephemeral port
+ * Resolve an OpenCode client:
+ * 1. OCD_SERVER_URL or default http://127.0.0.1:4097 → connect (probe session.list)
+ * 2. OPENCODE_BIN_PATH → prepend dir to PATH (for spawn)
+ * 3. If preferred URL is the default and unreachable → spawn `opencode serve --pure`
+ *    If OCD_SERVER_URL was set explicitly and unreachable → error (no silent fallback)
  *
  * `directory` becomes the OpenCode project root (x-opencode-directory).
  */
 export async function resolveClient(
   directory: string = process.cwd(),
 ): Promise<OpencodeClient> {
-  const serverUrl = process.env.OCD_SERVER_URL;
-  if (serverUrl) {
-    return connect(serverUrl, directory);
-  }
+  const explicitUrl = process.env.OCD_SERVER_URL;
+  const serverUrl = explicitUrl ?? DEFAULT_SERVER_URL;
 
   const binPath = process.env.OPENCODE_BIN_PATH;
   if (binPath) {
@@ -88,11 +89,13 @@ export async function resolveClient(
       binDir + nodePath.delimiter + (process.env.PATH ?? "");
   }
 
-  // Prefer an already-running local server (e.g. `opencode` TUI / serve)
   try {
-    return await connect("http://127.0.0.1:4096", directory);
-  } catch {
-    // not running — fall through to auto-spawn
+    return await connect(serverUrl, directory);
+  } catch (err: unknown) {
+    if (explicitUrl !== undefined) {
+      throw err;
+    }
+    // Default :4097 not up — fall through to auto-spawn
   }
 
   try {
@@ -115,7 +118,9 @@ export async function resolveClient(
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
         `cannot auto-spawn OpenCode server: ${msg}\n` +
-          `Install OpenCode or set OCD_SERVER_URL / OPENCODE_BIN_PATH.`,
+          `Start a dedicated serve, or set OCD_SERVER_URL:\n` +
+          `  opencode serve --hostname=127.0.0.1 --port=4097 --pure\n` +
+          `  export OCD_SERVER_URL=${DEFAULT_SERVER_URL}`,
       );
     }
   }
