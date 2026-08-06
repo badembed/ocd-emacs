@@ -21,7 +21,7 @@ program
   .argument("[question]", "question to ask")
   .option("-p, --paste", "include clipboard content")
   .option("-s, --session <name>", "named session to use or create")
-  .option("-v, --verbose", "log tool calls to stderr")
+  .option("-v, --verbose", "log reasoning and tool calls to stderr")
   .option("-l, --list-sessions", "list named sessions");
 
 program.parse();

@@ -4,7 +4,7 @@ import { setActiveAbort, clearActiveAbort } from "./client";
 const STREAM_TIMEOUT_MS = 120_000;
 
 export type StreamOptions = {
-  /** Log tool calls to stderr (`-v` / `OCD_VERBOSE`). */
+  /** Log reasoning + tool calls to stderr (`-v` / `OCD_VERBOSE`). */
   verbose?: boolean;
 };
 
@@ -68,19 +68,37 @@ export async function streamResponse(
     }
 
     const seenText = new Map<string, string>();
+    const seenReasoning = new Map<string, string>();
     const roles = new Map<string, "user" | "assistant">();
     /** Part IDs known to be assistant answer text (not reasoning/tool). */
     const textPartIDs = new Set<string>();
+    /** Part IDs known to be reasoning (stderr when verbose). */
+    const reasoningPartIDs = new Set<string>();
+    /** Tool parts that already logged a start / end line (dedupe SSE updates). */
+    const toolStarted = new Set<string>();
+    const toolFinished = new Set<string>();
     let sawAssistantText = false;
+    let reasoningOpen = false;
 
     const isUserMessage = (messageID: string): boolean =>
       roles.get(messageID) === "user";
 
     const writeAssistantText = (partID: string, chunk: string): void => {
       if (!chunk) return;
+      if (verbose && reasoningOpen) {
+        process.stderr.write("\n");
+        reasoningOpen = false;
+      }
       process.stdout.write(chunk);
       seenText.set(partID, (seenText.get(partID) ?? "") + chunk);
       sawAssistantText = true;
+    };
+
+    const writeReasoning = (partID: string, chunk: string): void => {
+      if (!verbose || !chunk) return;
+      process.stderr.write(chunk);
+      seenReasoning.set(partID, (seenReasoning.get(partID) ?? "") + chunk);
+      reasoningOpen = true;
     };
 
     const streamLoop = (async () => {
@@ -103,10 +121,13 @@ export async function streamResponse(
           if (
             props.sessionID === sessionID &&
             !isUserMessage(props.messageID) &&
-            props.field === "text" &&
-            textPartIDs.has(props.partID)
+            props.field === "text"
           ) {
-            writeAssistantText(props.partID, props.delta);
+            if (textPartIDs.has(props.partID)) {
+              writeAssistantText(props.partID, props.delta);
+            } else if (reasoningPartIDs.has(props.partID)) {
+              writeReasoning(props.partID, props.delta);
+            }
           }
           continue;
         }
@@ -140,13 +161,73 @@ export async function streamResponse(
                   writeAssistantText(part.id, part.text.slice(prev.length));
                   seenText.set(part.id, part.text);
                 } else if (part.text) {
-                  process.stdout.write(part.text);
+                  writeAssistantText(part.id, part.text);
                   seenText.set(part.id, part.text);
-                  sawAssistantText = true;
+                }
+              }
+            } else if (part.type === "reasoning" && verbose) {
+              reasoningPartIDs.add(part.id);
+              const delta = event.properties.delta;
+              if (delta !== undefined && delta.length > 0) {
+                writeReasoning(part.id, delta);
+              } else {
+                const prev = seenReasoning.get(part.id) ?? "";
+                const text = part.text ?? "";
+                if (text.startsWith(prev)) {
+                  writeReasoning(part.id, text.slice(prev.length));
+                  seenReasoning.set(part.id, text);
+                } else if (text) {
+                  writeReasoning(part.id, text);
+                  seenReasoning.set(part.id, text);
                 }
               }
             } else if (part.type === "tool" && verbose) {
-              process.stderr.write(`[tool: ${part.tool}...]\n`);
+              if (reasoningOpen) {
+                process.stderr.write("\n");
+                reasoningOpen = false;
+              }
+              const status = part.state.status;
+              if (status === "pending" || status === "running") {
+                if (toolStarted.has(part.id)) break;
+                const input = part.state.input;
+                // pending often arrives with {} before args are filled — wait.
+                if (
+                  status === "pending" &&
+                  Object.keys(input).length === 0
+                ) {
+                  break;
+                }
+                toolStarted.add(part.id);
+                const title =
+                  status === "running" ? part.state.title : undefined;
+                process.stderr.write(
+                  formatToolStart(part.tool, input, title),
+                );
+              } else if (status === "completed") {
+                if (toolFinished.has(part.id)) break;
+                toolFinished.add(part.id);
+                if (!toolStarted.has(part.id)) {
+                  toolStarted.add(part.id);
+                  process.stderr.write(
+                    formatToolStart(
+                      part.tool,
+                      part.state.input,
+                      part.state.title,
+                    ),
+                  );
+                }
+                process.stderr.write(formatToolDone(part.tool, part.state));
+              } else if (status === "error") {
+                if (toolFinished.has(part.id)) break;
+                toolFinished.add(part.id);
+                if (!toolStarted.has(part.id)) {
+                  toolStarted.add(part.id);
+                  process.stderr.write(
+                    formatToolStart(part.tool, part.state.input),
+                  );
+                }
+                process.stderr.write(formatToolError(part.tool, part.state));
+              }
             }
             break;
           }
@@ -194,6 +275,10 @@ export async function streamResponse(
 
     try {
       await Promise.race([streamLoop, timeout]);
+      if (verbose && reasoningOpen) {
+        process.stderr.write("\n");
+        reasoningOpen = false;
+      }
       // Role/text events can race; if SSE printed nothing, pull final assistant text.
       if (!sawAssistantText) {
         await flushSessionText(client, sessionID);
@@ -255,6 +340,67 @@ async function batchPrompt(
     }
   }
   process.stdout.write("\n");
+}
+
+const TOOL_LOG_MAX = 800;
+
+function truncateLog(text: string, max = TOOL_LOG_MAX): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max) + `…(+${text.length - max}b)`;
+}
+
+function formatToolInput(input: { [key: string]: unknown }): string {
+  // Prefer common command-like fields for readable one-liners.
+  for (const key of ["command", "cmd", "path", "filePath", "pattern", "query"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.length > 0) {
+      return truncateLog(`${key}=${JSON.stringify(v)}`);
+    }
+  }
+  try {
+    return truncateLog(JSON.stringify(input));
+  } catch {
+    return String(input);
+  }
+}
+
+function formatToolStart(
+  tool: string,
+  input: { [key: string]: unknown },
+  title?: string,
+): string {
+  const titleBit =
+    typeof title === "string" && title.length > 0 ? ` ${title}` : "";
+  const args = formatToolInput(input);
+  return `[tool:${tool}] start${titleBit}\n  ${args}\n`;
+}
+
+function formatToolDone(
+  tool: string,
+  state: {
+    output: string;
+    title: string;
+    time: { start: number; end: number };
+  },
+): string {
+  const ms = Math.max(0, state.time.end - state.time.start);
+  const out = truncateLog(state.output.replace(/\s+$/, ""));
+  const indented = out
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n");
+  return `[tool:${tool}] done ${ms}ms\n${indented}\n`;
+}
+
+function formatToolError(
+  tool: string,
+  state: {
+    error: string;
+    time: { start: number; end: number };
+  },
+): string {
+  const ms = Math.max(0, state.time.end - state.time.start);
+  return `[tool:${tool}] error ${ms}ms\n  ${truncateLog(state.error)}\n`;
 }
 
 /** Best-effort dump of assistant text if SSE ended early / timed out. */

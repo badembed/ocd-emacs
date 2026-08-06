@@ -13,7 +13,7 @@ ocd folder/ "что здесь?"                # папка = OpenCode working 
 ocd -p "объясни"                        # текст из буфера обмена
 ocd -s auth "продолжи"                  # именованная сессия (создать/возобновить)
 ocd -l                                  # список именованных сессий
-ocd -v "вопрос"                         # + tool-вызовы в stderr
+ocd -v "вопрос"                         # + reasoning и tool-вызовы в stderr
 ocd -s auth -p file.ts "всё вместе"     # комбинации
 ```
 
@@ -68,7 +68,7 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
   - `session.status` / `session.idle` — завершение.
 - Эхо-фильтр: пропускаем только известные `user` messages; неизвестный role + text parts печатаем (иначе пустой stdout).
 - Контекст: папка → OpenCode `directory`; файл → `directory` = parent + гибрид (≤4KB inline / path-only).
-- Tool noise в stderr только при `-v` или `OCD_VERBOSE=1|true`.
+- Tool/reasoning в stderr только при `-v` или `OCD_VERBOSE=1|true` (ответ — stdout). Tools: start+args, done+output (усечённо), error.
 
 ## Что сделано (10/11 задач + пост-фиксы; T11 отложен)
 
@@ -123,7 +123,7 @@ bunx tsc --noEmit                 # проверка типов
 7. `-p` без буфера → warning, вопрос без clipboard
 8. Ответ непустой, не error
 9. `-l` / `--list-sessions` → таблица name/id/messages/updated
-10. Без `-v` tool-строки в stderr нет; с `-v` / `OCD_VERBOSE=1` — есть
+10. Без `-v` reasoning/tool в stderr нет; с `-v` / `OCD_VERBOSE=1` — есть (stdout чистый)
 
 **Процессы OpenCode после запуска:**
 ```bash
@@ -150,7 +150,7 @@ lsof -nP -iTCP:4097 -sTCP:LISTEN   # должен быть один listener
 |---|---|
 | `OCD_SERVER_URL` | Явный сервер; при ошибке — fail, без auto-start |
 | `OPENCODE_BIN_PATH` | Путь к бинарнику `opencode` |
-| `OCD_VERBOSE` | `1` / `true` — tool-вызовы в stderr (как `-v`) |
+| `OCD_VERBOSE` | `1` / `true` — reasoning + tool-вызовы в stderr (как `-v`) |
 
 ## Правила работы с этим кодом
 
