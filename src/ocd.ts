@@ -78,9 +78,6 @@ async function main(): Promise<number> {
       })();
 
   // 7. Stream response
-  process.stderr.write(
-    `ocd: directory ${workspace.directory}\nocd: waiting for OpenCode...\n`,
-  );
   await streamResponse(client, sessionID, parts);
   return 0;
 }
