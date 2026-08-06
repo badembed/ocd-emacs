@@ -1,0 +1,18 @@
+{
+  "name": "ocd",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/ocd.ts --compile --outfile dist/ocd",
+    "build:all": "bun run build:mac && bun run build:linux"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.0",
+    "commander": "^14.0.0",
+    "clipboardy": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
