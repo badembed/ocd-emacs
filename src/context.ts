@@ -4,20 +4,55 @@ import {
   openSync,
   closeSync,
   statSync,
-  readdirSync,
 } from "node:fs";
+import { dirname, resolve as resolvePath } from "node:path";
 import type { TextPartInput } from "@opencode-ai/sdk";
 import clipboardy from "clipboardy";
 
 /** Files larger than this are sent as path + metadata, not full contents. */
 export const INLINE_MAX_BYTES = 4 * 1024;
 
+export type Workspace = {
+  /** OpenCode project root (x-opencode-directory). */
+  directory: string;
+  /** Absolute file path to attach as context, if any. */
+  file?: string;
+};
+
 /**
- * Build prompt parts in order: clipboard → file/folder → question.
+ * Resolve the OpenCode working directory (and optional file) from a CLI path.
+ * - folder → directory = that folder
+ * - file   → directory = parent folder, file = that file
+ * - none   → directory = cwd
+ */
+export function resolveWorkspace(path: string | undefined): Workspace {
+  if (!path) {
+    return { directory: process.cwd() };
+  }
+
+  try {
+    const abs = resolvePath(path);
+    const st = statSync(abs);
+    if (st.isDirectory()) {
+      return { directory: abs };
+    }
+    if (st.isFile()) {
+      return { directory: dirname(abs), file: abs };
+    }
+    throw new Error("not a file or directory");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error("path not found: " + path + (msg ? ` (${msg})` : ""));
+  }
+}
+
+/**
+ * Build prompt parts in order: clipboard → file (if any) → question.
+ * Folders are handled via OpenCode directory, not listed into the prompt.
  * Small files are inlined; large files are referenced by path only.
  */
 export function assembleParts(
-  path: string | undefined,
+  file: string | undefined,
   question: string,
   paste: boolean,
 ): TextPartInput[] {
@@ -43,28 +78,9 @@ export function assembleParts(
     }
   }
 
-  if (path) {
-    try {
-      const stat = statSync(path);
-      if (stat.isFile()) {
-        parts.push(filePart(path, stat.size));
-      } else if (stat.isDirectory()) {
-        const entries = readdirSync(path);
-        parts.push({
-          type: "text",
-          text: `--- Folder: ${path} ---\n${entries.join("\n")}`,
-        });
-      }
-    } catch (err: unknown) {
-      if (
-        err instanceof Error &&
-        err.message.startsWith("cannot read binary file")
-      ) {
-        throw err;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error("path not found: " + path + (msg ? ` (${msg})` : ""));
-    }
+  if (file) {
+    const st = statSync(file);
+    parts.push(filePart(file, st.size));
   }
 
   parts.push({ type: "text", text: question });
@@ -82,7 +98,7 @@ function filePart(path: string, size: number): TextPartInput {
       text:
         `--- File: ${path} (${formatBytes(size)}, not inlined) ---\n` +
         `This file is too large to embed in the prompt. ` +
-        `Read it with your file tools as needed (absolute or relative path: ${path}).`,
+        `Read it with your file tools as needed (path: ${path}).`,
     };
   }
 

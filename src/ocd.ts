@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { resolveClient, closeSpawnedServer } from "./client";
 import { resolveSession, listSessions } from "./sessions";
-import { assembleParts } from "./context";
+import { assembleParts, resolveWorkspace } from "./context";
 import { streamResponse } from "./stream";
 
 const program = new Command();
@@ -9,7 +9,10 @@ const program = new Command();
 program
   .name("ocd")
   .description("CLI wrapper for OpenCode Agent SDK")
-  .argument("[path]", "file or folder to include as context")
+  .argument(
+    "[path]",
+    "file (attach as context) or folder (OpenCode working directory)",
+  )
   .argument("[question]", "question to ask")
   .option("-p, --paste", "include clipboard content")
   .option("-s, --session <name>", "named session to use or create")
@@ -25,9 +28,9 @@ const opts = program.opts<{
 const args: string[] = program.args;
 
 async function main(): Promise<number> {
-  // 1. --list-sessions takes precedence
+  // 1. --list-sessions takes precedence (cwd workspace)
   if (opts.listSessions) {
-    const client = await resolveClient();
+    const client = await resolveClient(process.cwd());
     await listSessions(client);
     return 0;
   }
@@ -52,11 +55,12 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  // 4. Assemble parts early — fail on bad path/clipboard before spawning server
-  const parts = assembleParts(path, question, opts.paste === true);
+  // 4. Resolve workspace + assemble parts before spawning server
+  const workspace = resolveWorkspace(path);
+  const parts = assembleParts(workspace.file, question, opts.paste === true);
 
-  // 5. Resolve client
-  const client = await resolveClient();
+  // 5. Resolve client bound to the workspace directory
+  const client = await resolveClient(workspace.directory);
 
   // 6. Resolve or create session.
   // Always set a title on anonymous sessions so OpenCode skips the separate
@@ -74,7 +78,9 @@ async function main(): Promise<number> {
       })();
 
   // 7. Stream response
-  process.stderr.write("ocd: waiting for OpenCode...\n");
+  process.stderr.write(
+    `ocd: directory ${workspace.directory}\nocd: waiting for OpenCode...\n`,
+  );
   await streamResponse(client, sessionID, parts);
   return 0;
 }

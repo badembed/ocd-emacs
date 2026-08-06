@@ -21,11 +21,15 @@ export function closeSpawnedServer(): void {
  * 2. OPENCODE_BIN_PATH → prepend dir to PATH
  * 3. Existing local serve on :4096 → reuse
  * 4. Auto-spawn `opencode serve --pure` on ephemeral port
+ *
+ * `directory` becomes the OpenCode project root (x-opencode-directory).
  */
-export async function resolveClient(): Promise<OpencodeClient> {
+export async function resolveClient(
+  directory: string = process.cwd(),
+): Promise<OpencodeClient> {
   const serverUrl = process.env.OCD_SERVER_URL;
   if (serverUrl) {
-    return connect(serverUrl);
+    return connect(serverUrl, directory);
   }
 
   const binPath = process.env.OPENCODE_BIN_PATH;
@@ -42,13 +46,13 @@ export async function resolveClient(): Promise<OpencodeClient> {
 
   // Prefer an already-running local server (e.g. `opencode` TUI / serve)
   try {
-    return await connect("http://127.0.0.1:4096");
+    return await connect("http://127.0.0.1:4096", directory);
   } catch {
     // not running — fall through to auto-spawn
   }
 
   try {
-    return await spawnPureServer();
+    return await spawnPureServer(directory);
   } catch (err: unknown) {
     // Fallback to SDK spawn if --pure unsupported
     try {
@@ -60,7 +64,7 @@ export async function resolveClient(): Promise<OpencodeClient> {
       spawnedServer = result.server;
       return createOpencodeClient({
         baseUrl: result.server.url,
-        directory: process.cwd(),
+        directory,
       });
     } catch {
       const msg = err instanceof Error ? err.message : String(err);
@@ -72,10 +76,13 @@ export async function resolveClient(): Promise<OpencodeClient> {
   }
 }
 
-async function connect(baseUrl: string): Promise<OpencodeClient> {
+async function connect(
+  baseUrl: string,
+  directory: string,
+): Promise<OpencodeClient> {
   const client = createOpencodeClient({
     baseUrl,
-    directory: process.cwd(),
+    directory,
   });
   try {
     await client.session.list();
@@ -90,7 +97,7 @@ async function connect(baseUrl: string): Promise<OpencodeClient> {
  * Spawn `opencode serve --pure` so user plugins (e.g. OhMyOpenCode) don't
  * block headless one-shot prompts for ~60s+ / hang forever.
  */
-function spawnPureServer(): Promise<OpencodeClient> {
+function spawnPureServer(directory: string): Promise<OpencodeClient> {
   return new Promise((resolve, reject) => {
     const bin = process.env.OPENCODE_BIN_PATH || "opencode";
     const proc = spawn(
@@ -130,7 +137,7 @@ function spawnPureServer(): Promise<OpencodeClient> {
           proc.kill();
         },
       };
-      void connect(url).then(resolve, (err: unknown) => {
+      void connect(url, directory).then(resolve, (err: unknown) => {
         proc.kill();
         reject(err);
       });
