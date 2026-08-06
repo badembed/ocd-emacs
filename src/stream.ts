@@ -62,11 +62,47 @@ export async function streamResponse(
 
     const seenText = new Map<string, string>();
     const roles = new Map<string, "user" | "assistant">();
+    /** Part IDs known to be assistant answer text (not reasoning/tool). */
+    const textPartIDs = new Set<string>();
     let sawAssistantText = false;
+
+    const isUserMessage = (messageID: string): boolean =>
+      roles.get(messageID) === "user";
+
+    const writeAssistantText = (partID: string, chunk: string): void => {
+      if (!chunk) return;
+      process.stdout.write(chunk);
+      seenText.set(partID, (seenText.get(partID) ?? "") + chunk);
+      sawAssistantText = true;
+    };
 
     const streamLoop = (async () => {
       for await (const event of sub!.stream) {
         if (signal.aborted) return;
+
+        // Newer OpenCode emits this; @opencode-ai/sdk@1.18 types omit it.
+        if ((event as { type: string }).type === "message.part.delta") {
+          const props = (
+            event as unknown as {
+              properties: {
+                sessionID: string;
+                messageID: string;
+                partID: string;
+                field: string;
+                delta: string;
+              };
+            }
+          ).properties;
+          if (
+            props.sessionID === sessionID &&
+            !isUserMessage(props.messageID) &&
+            props.field === "text" &&
+            textPartIDs.has(props.partID)
+          ) {
+            writeAssistantText(props.partID, props.delta);
+          }
+          continue;
+        }
 
         switch (event.type) {
           case "message.updated": {
@@ -80,24 +116,21 @@ export async function streamResponse(
           case "message.part.updated": {
             const part = event.properties.part;
             if (part.sessionID !== sessionID) break;
+            // OpenCode often emits assistant text parts BEFORE message.updated
+            // sets role=assistant. Skip only known user messages.
+            if (isUserMessage(part.messageID)) break;
 
             if (part.type === "text") {
-              if (roles.get(part.messageID) !== "assistant") break;
+              textPartIDs.add(part.id);
               if (part.synthetic === true || part.ignored === true) break;
 
               const delta = event.properties.delta;
               if (delta !== undefined && delta.length > 0) {
-                process.stdout.write(delta);
-                seenText.set(part.id, (seenText.get(part.id) ?? "") + delta);
-                sawAssistantText = true;
+                writeAssistantText(part.id, delta);
               } else {
                 const prev = seenText.get(part.id) ?? "";
                 if (part.text.startsWith(prev)) {
-                  const diff = part.text.slice(prev.length);
-                  if (diff) {
-                    process.stdout.write(diff);
-                    sawAssistantText = true;
-                  }
+                  writeAssistantText(part.id, part.text.slice(prev.length));
                   seenText.set(part.id, part.text);
                 } else if (part.text) {
                   process.stdout.write(part.text);
@@ -154,7 +187,12 @@ export async function streamResponse(
 
     try {
       await Promise.race([streamLoop, timeout]);
-      process.stdout.write("\n");
+      // Role/text events can race; if SSE printed nothing, pull final assistant text.
+      if (!sawAssistantText) {
+        await flushSessionText(client, sessionID);
+      } else {
+        process.stdout.write("\n");
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("timed out")) {
