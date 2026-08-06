@@ -1,8 +1,148 @@
 import { Command } from "commander";
 import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk";
 import type { OpencodeClient } from "@opencode-ai/sdk";
-import { existsSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+} from "node:fs";
+import { homedir } from "node:os";
 import nodePath from "node:path";
+
+// ── Named-session store ────────────────────────────────────────────────
+
+const SESSIONS_DIR = nodePath.join(homedir(), ".ocd");
+const SESSIONS_FILE = nodePath.join(SESSIONS_DIR, "sessions.json");
+
+type SessionMapping = Record<string, string>;
+
+function readMapping(): SessionMapping {
+  try {
+    if (!existsSync(SESSIONS_FILE)) return {};
+    const raw = readFileSync(SESSIONS_FILE, "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) {
+      throw new SyntaxError("not a JSON object");
+    }
+    return parsed as SessionMapping;
+  } catch (err: unknown) {
+    if (err instanceof SyntaxError) {
+      console.error("warning: sessions.json is corrupt, reinitializing");
+    } else {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`warning: cannot read sessions.json (${msg}), reinitializing`);
+    }
+    return {};
+  }
+}
+
+function writeMapping(mapping: SessionMapping): void {
+  mkdirSync(SESSIONS_DIR, { recursive: true });
+  const tmp = SESSIONS_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(mapping, null, 2), "utf-8");
+  renameSync(tmp, SESSIONS_FILE);
+}
+
+/**
+ * Resolve a named session to a session ID.
+ * - If name starts with `ses_` → return as-is (direct session ID).
+ * - If name exists in mapping and the session still exists → return its ID.
+ * - If name is stale or missing → create a new session, save mapping, return new ID.
+ */
+export async function resolveSession(
+  client: OpencodeClient,
+  name: string,
+): Promise<string> {
+  // Direct session ID passthrough — do NOT touch the mapping
+  if (name.startsWith("ses_")) {
+    return name;
+  }
+
+  const mapping = readMapping();
+
+  // Check if name exists in mapping
+  if (mapping[name] !== undefined) {
+    const result = await client.session.get({
+      path: { id: mapping[name] },
+    });
+    if (!result.error) {
+      return mapping[name]; // session still exists
+    }
+    // Stale entry — remove and fall through to create
+    delete mapping[name];
+    writeMapping(mapping);
+  }
+
+  // Create a new session
+  const result = await client.session.create({
+    body: { title: name },
+  });
+  if (result.error) {
+    throw new Error(
+      `failed to create session "${name}": ${String(result.error)}`,
+    );
+  }
+  const id = result.data!.id;
+
+  mapping[name] = id;
+  writeMapping(mapping);
+  return id;
+}
+
+/**
+ * List all named sessions from the JSON store with their details (title,
+ * message count, last-updated time). Prints a table to stdout.
+ */
+export async function listSessions(client: OpencodeClient): Promise<void> {
+  const mapping = readMapping();
+  const entries = Object.entries(mapping).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
+
+  if (entries.length === 0) {
+    console.log("No named sessions.");
+    return;
+  }
+
+  const rows: Array<{
+    NAME: string;
+    "SESSION ID": string;
+    MESSAGES: string;
+    UPDATED: string;
+  }> = [];
+
+  for (const [name, id] of entries) {
+    let messages = "err";
+    let updated = "err";
+
+    try {
+      const getResult = await client.session.get({ path: { id } });
+      if (!getResult.error && getResult.data) {
+        updated = new Date(getResult.data.time.updated).toLocaleString();
+
+        const msgResult = await client.session.messages({ path: { id } });
+        if (!msgResult.error && msgResult.data) {
+          messages = String(msgResult.data.length);
+        }
+      }
+    } catch {
+      // leave as "err"
+    }
+
+    rows.push({
+      NAME: name,
+      "SESSION ID": id,
+      MESSAGES: messages,
+      UPDATED: updated,
+    });
+  }
+
+  console.table(rows);
+}
+
+// ── Client resolution (task 4) ──────────────────────────────────────────
 
 // Module-level handle for auto-spawned server — closed on exit.
 let spawnedServer: { close(): void } | undefined;
@@ -83,9 +223,19 @@ program.parse();
 const opts = program.opts();
 const args: string[] = program.args;
 
-// --list-sessions takes precedence over everything else
+// ── --list-sessions takes precedence over everything else ──────────────
+
 if (opts.listSessions) {
-  console.log("list=true");
+  try {
+    const client = await resolveClient();
+    await listSessions(client);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("error:", msg);
+    process.exit(1);
+  } finally {
+    closeSpawnedServer();
+  }
   process.exit(0);
 }
 
@@ -108,11 +258,16 @@ if (args.length >= 2) {
 void path;
 void question;
 
-// ── Client resolution (task 4) ────────────────────────────────────────
+// ── Client resolution (task 4) + session wiring (task 5) ─────────────
 
 try {
-  await resolveClient();
-  console.log("client=ok");
+  const client = await resolveClient();
+  if (opts.session) {
+    const sid = await resolveSession(client, opts.session);
+    console.log(`session=${sid}`);
+  } else {
+    console.log("client=ok");
+  }
 } catch (err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
   console.error("error:", msg);
