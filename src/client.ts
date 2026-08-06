@@ -4,9 +4,8 @@ import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import nodePath from "node:path";
 
-/** Module-level handle for auto-spawned server — closed on exit. */
+/** Ephemeral one-shot serve (killed on ocd exit). Not used for the :4097 daemon. */
 let spawnedServer: { close(): void } | undefined;
-/** Pid of auto-spawned serve — set at spawn time (before "listening"). */
 let spawnedPid: number | undefined;
 
 /** Active stream abort hook (session.abort + AbortController). */
@@ -23,7 +22,7 @@ function killPid(pid: number | undefined): void {
   }
 }
 
-/** Close the auto-spawned OpenCode server if one was started. */
+/** Close ephemeral auto-spawned server only (never the persistent :4097 daemon). */
 export function closeSpawnedServer(): void {
   if (spawnedServer) {
     try {
@@ -37,7 +36,6 @@ export function closeSpawnedServer(): void {
   spawnedPid = undefined;
 }
 
-/** Register cleanup for the in-flight stream (called on SIGINT/timeout). */
 export function setActiveAbort(fn: () => void): void {
   activeAbort = fn;
 }
@@ -46,7 +44,6 @@ export function clearActiveAbort(): void {
   activeAbort = undefined;
 }
 
-/** Abort the active stream/session if any. */
 export function abortActiveSession(): void {
   const fn = activeAbort;
   activeAbort = undefined;
@@ -61,15 +58,14 @@ export function abortActiveSession(): void {
 
 /** Default ocd-dedicated OpenCode serve (override with OCD_SERVER_URL). */
 export const DEFAULT_SERVER_URL = "http://127.0.0.1:4097";
+const DEFAULT_PORT = 4097;
 
 /**
  * Resolve an OpenCode client:
- * 1. OCD_SERVER_URL or default http://127.0.0.1:4097 → connect (probe session.list)
- * 2. OPENCODE_BIN_PATH → prepend dir to PATH (for spawn)
- * 3. If preferred URL is the default and unreachable → spawn `opencode serve --pure`
- *    If OCD_SERVER_URL was set explicitly and unreachable → error (no silent fallback)
- *
- * `directory` becomes the OpenCode project root (x-opencode-directory).
+ * 1. OCD_SERVER_URL or default :4097 → connect
+ * 2. If default is down → start persistent `opencode serve --pure` on :4097 (survives ocd exit)
+ * 3. Explicit OCD_SERVER_URL down → error (no auto-start)
+ * 4. Last resort → ephemeral --pure (killed on exit)
  */
 export async function resolveClient(
   directory: string = process.cwd(),
@@ -95,13 +91,19 @@ export async function resolveClient(
     if (explicitUrl !== undefined) {
       throw err;
     }
-    // Default :4097 not up — fall through to auto-spawn
+  }
+
+  // First-run (or daemon died): start persistent pure serve on :4097
+  try {
+    await ensurePersistentDaemon();
+    return await connect(DEFAULT_SERVER_URL, directory);
+  } catch {
+    // fall through to ephemeral
   }
 
   try {
-    return await spawnPureServer(directory);
+    return await spawnEphemeralPureServer(directory);
   } catch (err: unknown) {
-    // Fallback to SDK spawn if --pure unsupported
     try {
       const result = await createOpencode({
         hostname: "127.0.0.1",
@@ -117,10 +119,9 @@ export async function resolveClient(
     } catch {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `cannot auto-spawn OpenCode server: ${msg}\n` +
-          `Start a dedicated serve, or set OCD_SERVER_URL:\n` +
-          `  opencode serve --hostname=127.0.0.1 --port=4097 --pure\n` +
-          `  export OCD_SERVER_URL=${DEFAULT_SERVER_URL}`,
+        `cannot start OpenCode server: ${msg}\n` +
+          `Try manually:\n` +
+          `  opencode serve --hostname=127.0.0.1 --port=${DEFAULT_PORT} --pure`,
       );
     }
   }
@@ -144,10 +145,85 @@ async function connect(
 }
 
 /**
- * Spawn `opencode serve --pure` so user plugins (e.g. OhMyOpenCode) don't
- * block headless one-shot prompts for ~60s+ / hang forever.
+ * Start a long-lived `opencode serve --pure` on :4097.
+ * Detached + unref — survives ocd exit; not killed by closeSpawnedServer().
  */
-function spawnPureServer(directory: string): Promise<OpencodeClient> {
+function ensurePersistentDaemon(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const bin = process.env.OPENCODE_BIN_PATH || "opencode";
+    const proc = spawn(
+      bin,
+      [
+        "serve",
+        "--hostname=127.0.0.1",
+        `--port=${DEFAULT_PORT}`,
+        "--pure",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env },
+        detached: true,
+      },
+    );
+
+    // Don't keep ocd alive waiting on this child after we connect.
+    proc.unref();
+
+    let output = "";
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(
+        new Error(
+          `Timeout starting OpenCode daemon on :${DEFAULT_PORT}\n${output.slice(-500)}`,
+        ),
+      );
+    }, 15_000);
+
+    const finishOk = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+
+    const onData = (chunk: Buffer) => {
+      if (settled) return;
+      output += chunk.toString();
+      // Already running / race with another ocd — treat as success and reconnect.
+      if (
+        /opencode server listening/i.test(output) ||
+        /EADDRINUSE|address already in use/i.test(output)
+      ) {
+        finishOk();
+      }
+    };
+
+    proc.stdout?.on("data", onData);
+    proc.stderr?.on("data", onData);
+    proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(err);
+    });
+    proc.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      // If it exited immediately with EADDRINUSE already handled above.
+      reject(
+        new Error(
+          `OpenCode daemon exited with code ${code}\n${output.slice(-500)}`,
+        ),
+      );
+    });
+  });
+}
+
+/** One-shot serve on ephemeral port — killed when ocd exits. */
+function spawnEphemeralPureServer(directory: string): Promise<OpencodeClient> {
   return new Promise((resolve, reject) => {
     const bin = process.env.OPENCODE_BIN_PATH || "opencode";
     const proc = spawn(
@@ -159,7 +235,6 @@ function spawnPureServer(directory: string): Promise<OpencodeClient> {
       },
     );
 
-    // Set immediately — child may appear in ps before "listening" is parsed.
     spawnedPid = proc.pid;
 
     const killProc = (): void => {

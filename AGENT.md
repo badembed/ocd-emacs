@@ -34,10 +34,11 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
 ## Поиск OpenCode (порядок приоритета)
 
 1. `OCD_SERVER_URL` или дефолт `http://127.0.0.1:4097` → connect + probe `session.list()`
-2. Если дефолтный `:4097` недоступен → `opencode serve --pure` (ephemeral port); явный `OCD_SERVER_URL` при ошибке — fail (без fallback)
-3. `OPENCODE_BIN_PATH` → бинарь для spawn (через PATH)
+2. Если дефолт мёртв → **один раз** поднять persistent `opencode serve --hostname=127.0.0.1 --port=4097 --pure` (detached, не убиваем при выходе `ocd`)
+3. Явный `OCD_SERVER_URL` при ошибке → fail
+4. Last resort → ephemeral `--pure` на port 0 (убивается при выходе)
 
-Рекомендуемый быстрый режим: держать `opencode serve --hostname=127.0.0.1 --port=4097 --pure` в фоне.
+Рекомендуемый быстрый режим после первого запуска: daemon уже на `:4097`.
 
 ## Структура `src/`
 
