@@ -329,19 +329,130 @@ export function assembleParts(
   return parts;
 }
 
-// ── Client resolution (task 4) + session wiring (task 5) ─────────────
+// ── Streaming output (task 7) ─────────────────────────────────────────
+
+/**
+ * Send a prompt via `promptAsync` and stream the answer to stdout in real
+ * time via SSE events. Falls back to batch `prompt()` if promptAsync is
+ * unavailable.
+ */
+export async function streamResponse(
+  client: OpencodeClient,
+  sessionID: string,
+  parts: TextPartInput[],
+): Promise<void> {
+  // 1. Send prompt (fire-and-forget via promptAsync)
+  let useBatchFallback = false;
+  try {
+    const result = await client.session.promptAsync({
+      path: { id: sessionID },
+      body: { parts },
+    });
+    if (result.error) {
+      throw new Error(String(result.error));
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`warning: promptAsync unavailable (${msg}), using batch mode`);
+    useBatchFallback = true;
+  }
+
+  // 2. Batch fallback — block until complete, then print assistant text
+  if (useBatchFallback) {
+    const result = await client.session.prompt({
+      path: { id: sessionID },
+      body: { parts },
+    });
+    if (result.error) {
+      throw new Error(`prompt failed: ${String(result.error)}`);
+    }
+    if (result.data) {
+      for (const part of result.data.parts) {
+        if (part.type === "text" && part.synthetic !== true && part.ignored !== true) {
+          process.stdout.write(part.text);
+        }
+      }
+    }
+    process.stdout.write("\n");
+    return;
+  }
+
+  // 3. SSE streaming — subscribe globally, filter by our sessionID.
+  // User message parts arrive first (no delta, no synthetic flag); assistant
+  // parts arrive after with growing `.text`. Use messageID tracking: skip
+  // parts from the first messageID (the user's own echo), emit diff text
+  // from subsequent messageIDs.
+  const sub = await client.event.subscribe();
+  const seenText = new Map<string, string>(); // partID → previously seen text
+  let userMessageID: string | undefined;
+
+  try {
+    for await (const event of sub.stream) {
+      switch (event.type) {
+        case "message.part.updated": {
+          const part = event.properties.part;
+          if (part.sessionID !== sessionID) break;
+
+          if (part.type === "text") {
+            // First text part we see belongs to the user message — skip it
+            if (userMessageID === undefined) {
+              userMessageID = part.messageID;
+            }
+            if (part.messageID === userMessageID) break;
+
+            const prev = seenText.get(part.id) ?? "";
+            if (part.text.startsWith(prev)) {
+              const diff = part.text.slice(prev.length);
+              if (diff) process.stdout.write(diff);
+              seenText.set(part.id, part.text);
+            } else {
+              // Non-contiguous update — emit full text
+              process.stdout.write(part.text);
+              seenText.set(part.id, part.text);
+            }
+          } else if (part.type === "tool") {
+            process.stderr.write(`[tool: ${part.tool}...]\n`);
+          }
+          break;
+        }
+        case "session.status": {
+          const props = event.properties;
+          if (props.sessionID === sessionID && props.status.type === "idle") {
+            process.stdout.write("\n");
+            return;
+          }
+          break;
+        }
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`stream error: ${msg}`);
+  }
+
+  // Stream ended without idle — flush
+  process.stdout.write("\n");
+}
+
+// ── Main ───────────────────────────────────────────────────────────────
 
 let exitCode = 0;
 try {
   const client = await resolveClient();
-  if (opts.session) {
-    const sid = await resolveSession(client, opts.session);
-    console.log(`session=${sid}`);
-  } else if (question) {
+
+  if (question) {
+    const sessionID = opts.session
+      ? await resolveSession(client, opts.session)
+      : await client.session.create({ body: {} }).then((r) => {
+          if (r.error) throw new Error(`failed to create session: ${String(r.error)}`);
+          return r.data!.id;
+        });
+
     const parts = assembleParts(path, question, opts.paste);
-    console.log(`parts=${parts.length}`);
-  } else {
-    console.log("client=ok");
+    await streamResponse(client, sessionID, parts);
+  } else if (opts.session) {
+    // Resolve session for future use (ensure it exists)
+    await resolveSession(client, opts.session);
   }
 } catch (err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
