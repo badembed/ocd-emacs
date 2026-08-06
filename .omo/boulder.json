@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "active_work_id": "ocd-cli-wrapper",
+  "works": {
+    "ocd-cli-wrapper": {
+      "work_id": "ocd-cli-wrapper",
+      "active_plan": ".omo/plans/ocd-cli-wrapper.md",
+      "plan_name": "ocd-cli-wrapper",
+      "session_ids": ["opencode:ses_0285d80d6ffedj5u2R9HRbZNSG"],
+      "status": "active",
+      "worktree_path": null
+    }
+  }
+}
