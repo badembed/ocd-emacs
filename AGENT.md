@@ -58,6 +58,7 @@ ocd -s auth -p file.ts "всё вместе"     # комбинации
   - `message.part.updated` → `{ part: TextPart|ToolPart, delta?: string }` — дельты текста ассистента;
   - `session.status` → `{ status: { type: "idle" } }` — завершение обработки.
 - Типы: `TextPartInput = { type: "text", text }`; `FilePartInput` требует URL — **не используется**, контекст всегда TextPartInput.
+- Контекст файлов (гибрид): ≤64KB → inline в TextPart; больше → path + size + просьба читать через tools (stderr warning). Папка — листинг первого уровня.
 - Эхо-фильтр: первый message (вопрос пользователя) НЕ выводится; стримим только текст ассистента по `delta`.
 
 ## Что сделано (10/11 задач + фиксы; T11 отложен)
