@@ -229,17 +229,18 @@ const args: string[] = program.args;
 // ── --list-sessions takes precedence over everything else ──────────────
 
 if (opts.listSessions) {
+  let exitCode = 0;
   try {
     const client = await resolveClient();
     await listSessions(client);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("error:", msg);
-    process.exit(1);
+    exitCode = 1;
   } finally {
     closeSpawnedServer();
   }
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 // Disambiguation: commander assigns positional args in order,
@@ -330,6 +331,7 @@ export function assembleParts(
 
 // ── Client resolution (task 4) + session wiring (task 5) ─────────────
 
+let exitCode = 0;
 try {
   const client = await resolveClient();
   if (opts.session) {
@@ -344,9 +346,9 @@ try {
 } catch (err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
   console.error("error:", msg);
-  process.exit(1);
+  exitCode = 1;
 } finally {
   closeSpawnedServer();
 }
 
-process.exit(0);
+process.exit(exitCode);
