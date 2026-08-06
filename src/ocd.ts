@@ -58,11 +58,15 @@ async function main(): Promise<number> {
   // 5. Resolve client
   const client = await resolveClient();
 
-  // 6. Resolve or create session
+  // 6. Resolve or create session.
+  // Always set a title on anonymous sessions so OpenCode skips the separate
+  // title-agent LLM call (which frequently hangs on small models).
   const sessionID = opts.session
     ? await resolveSession(client, opts.session)
     : await (async () => {
-        const created = await client.session.create({ body: {} });
+        const title =
+          question.length > 48 ? question.slice(0, 45) + "..." : question;
+        const created = await client.session.create({ body: { title } });
         if (created.error) {
           throw new Error(`failed to create session: ${String(created.error)}`);
         }
@@ -70,6 +74,7 @@ async function main(): Promise<number> {
       })();
 
   // 7. Stream response
+  process.stderr.write("ocd: waiting for OpenCode...\n");
   await streamResponse(client, sessionID, parts);
   return 0;
 }
