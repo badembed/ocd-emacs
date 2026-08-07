@@ -33,8 +33,8 @@ Ensure `bun` and `opencode` are on your `PATH` in both shells and GUI Emacs (mac
 ### 2. Clone and install dependencies
 
 ```bash
-git clone <THIS_REPO_URL> ~/src/ocd   # or any path you prefer
-cd ~/src/ocd
+git clone https://github.com/badembed/ocd-emacs.git ~/src/ocd-emacs
+cd ~/src/ocd-emacs
 bun install
 ```
 
@@ -47,7 +47,7 @@ mkdir -p ~/bin
 cat > ~/bin/ocd <<'EOF'
 #!/usr/bin/env bash
 # Point REPO at your clone:
-REPO="${OCD_REPO:-$HOME/src/ocd}"
+REPO="${OCD_REPO:-$HOME/src/ocd-emacs}"
 exec bun run "$REPO/src/ocd.ts" "$@"
 EOF
 chmod +x ~/bin/ocd
@@ -80,7 +80,7 @@ Named CLI sessions are stored under `~/.ocd/`. Override the server with `OCD_SER
 #### Plain Emacs
 
 ```elisp
-(add-to-list 'load-path "~/src/ocd")   ; directory that contains opencode-chat.el
+(add-to-list 'load-path "~/src/ocd-emacs") ; directory that contains opencode-chat.el
 (require 'opencode-chat)
 (setq opencode-chat-ocd-program (expand-file-name "~/bin/ocd"))
 ;; optional:
@@ -93,7 +93,7 @@ Named CLI sessions are stored under `~/.ocd/`. Override the server with `OCD_SER
 
 ```bash
 mkdir -p ~/.emacs.d/private/local/opencode-chat
-ln -sf ~/src/ocd/opencode-chat.el \
+ln -sf ~/src/ocd-emacs/opencode-chat.el \
   ~/.emacs.d/private/local/opencode-chat/opencode-chat.el
 ```
 
