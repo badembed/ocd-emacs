@@ -4,6 +4,7 @@ import {
   handlePermission,
   normalizePermissionEvent,
   type PermissionMode,
+  type WaitPermissionReply,
 } from "./permissions";
 
 const STREAM_TIMEOUT_MS = 120_000;
@@ -20,6 +21,11 @@ export type StreamOptions = {
    * raw text on stdout.
    */
   jsonl?: boolean;
+  /**
+   * Wait for a JSONL `permission_reply` from the stdin demux (Emacs).
+   * Required when `permissionMode` is `jsonl`.
+   */
+  waitPermissionReply?: WaitPermissionReply;
 };
 
 /** Write assistant text to stdout in plain or JSONL form. */
@@ -53,6 +59,7 @@ export async function streamResponse(
   const jsonl = options.jsonl === true;
   const permissionMode: PermissionMode =
     options.permissionMode ?? "reject";
+  const waitPermissionReply = options.waitPermissionReply;
   const controller = new AbortController();
   const { signal } = controller;
 
@@ -206,6 +213,7 @@ export async function streamResponse(
                   mode: permissionMode,
                   signal,
                   answered: answeredPermissions,
+                  waitPermissionReply,
                 });
               } finally {
                 if (!signal.aborted) armTimeout();

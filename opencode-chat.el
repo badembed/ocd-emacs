@@ -35,6 +35,8 @@
 
 ;;; Code:
 
+(require 'json)
+
 ;;;###autoload
 (defgroup opencode-chat nil
   "Multi-turn chat with OpenCode sessions in Emacs buffers."
@@ -266,6 +268,8 @@ stdin line-by-line, so embedded newlines would enqueue extra turns."
   (unless (and (boundp 'opencode-chat--process)
                opencode-chat--process)
     (user-error "opencode-chat-abort: no subprocess running"))
+  ;; Best-effort: reject any queued permission asks before SIGINT.
+  (opencode-chat--reject-pending-permissions)
   (interrupt-process opencode-chat--process)
   (let ((stderr-buf (get-buffer-create "*opencode-chat-stderr*")))
     (with-current-buffer stderr-buf
@@ -509,6 +513,15 @@ before the next assistant region is recorded in
 `opencode-chat--bounds'.")
 (make-variable-buffer-local 'opencode-chat--prompt-marker)
 
+(defvar opencode-chat--permission-queue nil
+  "Queue of pending OpenCode permission asks from `ocd --jsonl'.
+Each entry is a plist (:id ID :permission TYPE :title TITLE :patterns LIST).")
+(make-variable-buffer-local 'opencode-chat--permission-queue)
+
+(defvar opencode-chat--permission-asking nil
+  "Non-nil while a permission minibuffer prompt is active.")
+(make-variable-buffer-local 'opencode-chat--permission-asking)
+
 ;;; Mode and keymap.
 
 ;;;###autoload
@@ -693,8 +706,10 @@ Each line is one of:
   response; concatenated into the current response region.
 - `{\"type\":\"session_id\",\"id\":\"...\"}' -- the OpenCode server-side
   session ID; stored in `opencode-chat--session-id'.
+- `{\"type\":\"permission\",...}' -- permission ask; answered via
+  minibuffer and a JSONL `permission_reply' on stdin.
 - Other types (reasoning, tool calls, etc.) -- logged to
-  `*opencode-chat-stderr*' and skipped (todo 10+ handles tool rendering)."
+  `*opencode-chat-stderr*' and skipped."
   (let ((buf (process-buffer proc)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
@@ -714,11 +729,117 @@ Each line is one of:
                 (dolist (line (split-string complete "\n" t))
                   (opencode-chat--process-line line stderr-buf))))))))))
 
+(defun opencode-chat--send-permission-reply (proc id response)
+  "Send a JSONL permission_reply for ID with RESPONSE to PROC."
+  (when (and proc (process-live-p proc))
+    (process-send-string
+     proc
+     (concat (json-encode
+              `((type . "permission_reply")
+                (id . ,id)
+                (response . ,response)))
+             "\n"))))
+
+(defun opencode-chat--reject-pending-permissions ()
+  "Reject queued permission asks and clear the permission queue.
+Sends `reject' for each pending id when the subprocess is live."
+  (let ((proc opencode-chat--process)
+        (queue opencode-chat--permission-queue))
+    (setq opencode-chat--permission-queue nil)
+    (dolist (ask queue)
+      (opencode-chat--send-permission-reply
+       proc (plist-get ask :id) "reject"))))
+
+(defun opencode-chat--drain-permission-queue ()
+  "Prompt for the next queued permission ask, if any."
+  (when (and (not opencode-chat--permission-asking)
+             opencode-chat--permission-queue)
+    (setq opencode-chat--permission-asking t)
+    (let* ((ask (pop opencode-chat--permission-queue))
+           (proc opencode-chat--process)
+           (id (plist-get ask :id))
+           (title (or (plist-get ask :title)
+                      (plist-get ask :permission)
+                      "permission"))
+           (patterns (plist-get ask :patterns))
+           (prompt (if patterns
+                       (format "%s [%s]" title
+                               (mapconcat #'identity patterns ", "))
+                     title))
+           (stderr-buf (get-buffer-create "*opencode-chat-stderr*"))
+           response)
+      (unwind-protect
+          (setq response
+                (condition-case nil
+                    (let ((choice
+                           (read-multiple-choice
+                            (format "OpenCode permission: %s " prompt)
+                            '((?y "once" "approve once")
+                              (?a "always" "approve always")
+                              (?n "reject" "reject")))))
+                      (pcase (nth 1 choice)
+                        ("once" "once")
+                        ("always" "always")
+                        (_ "reject")))
+                  (quit "reject")))
+        (setq opencode-chat--permission-asking nil)
+        (opencode-chat--send-permission-reply proc id (or response "reject"))
+        (with-current-buffer stderr-buf
+          (goto-char (point-max))
+          (insert (format "[%s] permission %s → %s\n"
+                          (format-time-string "%H:%M:%S")
+                          id
+                          (or response "reject"))))
+        (when opencode-chat--permission-queue
+          (run-at-time 0 nil #'opencode-chat--drain-permission-queue-in
+                       (current-buffer)))))))
+
+(defun opencode-chat--drain-permission-queue-in (buffer)
+  "Call `opencode-chat--drain-permission-queue' in BUFFER if live."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (opencode-chat--drain-permission-queue))))
+
+(defun opencode-chat--enqueue-permission (parsed)
+  "Queue a permission ask from PARSED JSONL alist and schedule UI."
+  (let* ((id (alist-get "id" parsed nil nil #'string=))
+         (permission (alist-get "permission" parsed nil nil #'string=))
+         (title (alist-get "title" parsed nil nil #'string=))
+         (patterns (alist-get "patterns" parsed nil nil #'string=))
+         (stderr-buf (get-buffer-create "*opencode-chat-stderr*")))
+    (if (not (and id (stringp id) (not (string-empty-p id))))
+        (with-current-buffer stderr-buf
+          (goto-char (point-max))
+          (insert (format "[%s] permission event missing id: %S\n"
+                          (format-time-string "%H:%M:%S")
+                          parsed)))
+      (with-current-buffer stderr-buf
+        (goto-char (point-max))
+        (insert (format "[%s] permission ask: %s (%s)\n"
+                        (format-time-string "%H:%M:%S")
+                        (or title permission "unknown")
+                        id)))
+      (setq opencode-chat--permission-queue
+            (append opencode-chat--permission-queue
+                    (list (list :id id
+                                :permission permission
+                                :title title
+                                :patterns (and (vectorp patterns)
+                                               (append patterns nil))))))
+      (run-at-time 0 nil #'opencode-chat--drain-permission-queue-in
+                   (current-buffer)))))
+
 (defun opencode-chat--process-line (line stderr-buf)
   "Parse one JSON line from ocd --stream and apply it.
 LINE is a complete JSON line (without trailing newline).
 STDERR-BUF is the buffer for logging unknown event types and errors.
-Must be called with the chat buffer current."
+Must be called with the chat buffer current.
+
+Handled types:
+- `text' -- assistant chunk into the response region
+- `session_id' -- persist OpenCode session id
+- `permission' -- ask the user; reply via JSONL permission_reply
+- other -- log to STDERR-BUF"
   (condition-case err
       (let* ((parsed (json-parse-string line :object-type 'alist))
              (type (alist-get "type" parsed nil nil #'string=)))
@@ -737,6 +858,8 @@ Must be called with the chat buffer current."
                         (opencode-chat--local-variables-start))
                (save-excursion
                  (add-file-local-variable 'opencode-chat--session-id id)))))
+          ("permission"
+           (opencode-chat--enqueue-permission parsed))
           (_
            (with-current-buffer stderr-buf
              (goto-char (point-max))

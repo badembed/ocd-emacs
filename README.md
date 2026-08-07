@@ -130,6 +130,10 @@ Chat files live in `~/.opencode-chat/sessions/<name>.md`. Emacs talks to `ocd` a
 
 `ocd --stream --jsonl --name <session> [--auto]`
 
+When OpenCode asks for a permission, Emacs shows `read-multiple-choice`
+(`once` / `always` / `reject`) and replies over JSONL. With
+`opencode-chat-auto-approve` non-nil, `ocd` gets `--auto` and skips the prompt.
+
 If the buffer says there is no subprocess, `opencode-chat-ocd-program` is wrong or not executable — check with `M-: (executable-find opencode-chat-ocd-program)`.
 
 ## CLI usage
@@ -157,11 +161,20 @@ ocd --stream --jsonl --name math
 
 Exit the loop with `quit`, stdin EOF, or idle SIGINT. Mid-stream SIGINT aborts the current answer and waits for the next prompt.
 
+With `--jsonl`, permission asks are machine-readable:
+
+```text
+← {"type":"permission","id":"…","permission":"bash","title":"…"}
+→ {"type":"permission_reply","id":"…","response":"once"}
+```
+
+In a plain TTY `--stream` (no `--jsonl`), permissions use stderr prompts (`y`/`a`/`n`).
+
 | Flag | Meaning |
 |------|---------|
 | `--stream` | Read prompts from stdin, one line per turn |
 | `-n, --name` | Session name (**required** with `--stream`) |
-| `--jsonl` | Emit `{"type":"session_id"\|"text",...}` lines |
+| `--jsonl` | Emit `session_id` / `text` / `permission` JSON lines |
 | `--auto` | Auto-approve OpenCode permissions |
 
 ## Emacs reference (`opencode-chat.el`)

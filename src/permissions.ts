@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
 import type { OpencodeClient } from "@opencode-ai/sdk";
 
-export type PermissionMode = "interactive" | "auto" | "reject";
+export type PermissionMode = "interactive" | "auto" | "reject" | "jsonl";
 export type PermissionResponse = "once" | "always" | "reject";
 
 export type PermissionInfo = {
@@ -11,6 +11,11 @@ export type PermissionInfo = {
   sessionID: string;
   pattern?: string | Array<string>;
 };
+
+export type WaitPermissionReply = (
+  id: string,
+  signal?: AbortSignal,
+) => Promise<PermissionResponse>;
 
 /**
  * Normalize SSE permission payloads.
@@ -81,22 +86,84 @@ export function normalizePermissionEvent(
 
 /**
  * Resolve how ocd should answer OpenCode permission prompts.
- * --auto / OCD_AUTO → auto; TTY → interactive; else reject (no hang).
+ * --auto / OCD_AUTO → auto; --jsonl → jsonl; TTY → interactive; else reject.
  */
 export function resolvePermissionMode(opts: {
   autoFlag?: boolean;
+  jsonlFlag?: boolean;
   env?: NodeJS.ProcessEnv;
   stdinIsTTY?: boolean | null;
 }): PermissionMode {
   const env = opts.env ?? process.env;
   const autoEnv = env.OCD_AUTO === "1" || env.OCD_AUTO === "true";
   if (opts.autoFlag === true || autoEnv) return "auto";
+  if (opts.jsonlFlag === true) return "jsonl";
   const tty =
     opts.stdinIsTTY !== undefined && opts.stdinIsTTY !== null
       ? opts.stdinIsTTY
       : Boolean(process.stdin.isTTY);
   if (tty) return "interactive";
   return "reject";
+}
+
+export function isPermissionResponse(
+  value: unknown,
+): value is PermissionResponse {
+  return value === "once" || value === "always" || value === "reject";
+}
+
+/**
+ * Parse a stdin control line for JSONL permission replies.
+ * Returns undefined when the line is not a permission_reply object.
+ */
+export function parsePermissionReply(
+  line: string,
+): { id: string; response: PermissionResponse } | undefined {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type !== "permission_reply") return undefined;
+  const id = typeof obj.id === "string" ? obj.id : undefined;
+  if (!id) {
+    process.stderr.write(
+      "warning: permission_reply missing id, ignoring\n",
+    );
+    return undefined;
+  }
+  if (!isPermissionResponse(obj.response)) {
+    process.stderr.write(
+      `warning: permission_reply for ${id} has invalid response, rejecting\n`,
+    );
+    return { id, response: "reject" };
+  }
+  return { id, response: obj.response };
+}
+
+/** Emit a JSONL permission ask on stdout for machine clients. */
+export function writePermissionJsonl(perm: PermissionInfo): void {
+  const patterns =
+    perm.pattern === undefined
+      ? undefined
+      : Array.isArray(perm.pattern)
+        ? perm.pattern
+        : [perm.pattern];
+  const event: Record<string, unknown> = {
+    type: "permission",
+    id: perm.id,
+    permission: perm.type,
+    title: perm.title,
+  };
+  if (patterns !== undefined && patterns.length > 0) {
+    event.patterns = patterns;
+  }
+  process.stdout.write(JSON.stringify(event) + "\n");
 }
 
 export async function replyPermission(
@@ -213,6 +280,7 @@ export function promptPermission(
 
 /**
  * Decide and send a permission reply. Dedupes by permission id via `answered`.
+ * For `jsonl` mode, `waitPermissionReply` must be provided by the stdin demux.
  */
 export async function handlePermission(opts: {
   client: OpencodeClient;
@@ -221,6 +289,7 @@ export async function handlePermission(opts: {
   mode: PermissionMode;
   signal?: AbortSignal;
   answered: Set<string>;
+  waitPermissionReply?: WaitPermissionReply;
 }): Promise<void> {
   const { client, sessionID, perm, mode, signal, answered } = opts;
 
@@ -239,6 +308,34 @@ export async function handlePermission(opts: {
       `[permission] ${perm.type}: rejected (non-TTY; use --auto to approve)\n` +
         `  ${perm.title}\n`,
     );
+  } else if (mode === "jsonl") {
+    const wait = opts.waitPermissionReply;
+    if (!wait) {
+      process.stderr.write(
+        `warning: jsonl permission mode without waitPermissionReply, rejecting\n`,
+      );
+      response = "reject";
+    } else {
+      writePermissionJsonl(perm);
+      try {
+        response = await wait(perm.id, signal);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg === "aborted" || signal?.aborted) {
+          // Prefer reject-then-abort so OpenCode does not hang the tool.
+          try {
+            await replyPermission(client, sessionID, perm.id, "reject");
+          } catch {
+            // best-effort
+          }
+          throw err instanceof Error ? err : new Error(msg);
+        }
+        process.stderr.write(
+          `warning: permission_reply failed (${msg}), rejecting\n`,
+        );
+        response = "reject";
+      }
+    }
   } else {
     try {
       response = await promptPermission(perm, signal);

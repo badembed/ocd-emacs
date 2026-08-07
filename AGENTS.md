@@ -15,10 +15,23 @@ Do **not** add: TUI, MCP/tool rendering, multimodal, Windows-specific code, here
 
 | Mode | stdout |
 |------|--------|
-| `ocd --stream` (default) | plain assistant text |
-| `ocd --stream --jsonl` | `{"type":"session_id","id":"..."}\n` then `{"type":"text","text":"..."}\n` per chunk |
+| `ocd --stream` (default) | plain assistant text; TTY permissions on stderr (`y`/`a`/`n`) |
+| `ocd --stream --jsonl` | `session_id` / `text` / `permission` JSON lines |
 
-Emacs always passes `--jsonl`. Prompts are **one line** each (`quit` / EOF / idle SIGINT end the loop).
+Emacs always passes `--jsonl`. Chat prompts are **one plain line** each (`quit` / EOF / idle SIGINT end the loop).
+
+### JSONL permission handshake
+
+Permission mode with `--jsonl` (unless `--auto`): stdin demux stays active during streams.
+
+```text
+← {"type":"permission","id":"…","permission":"bash","title":"…","patterns":["…"]}
+→ {"type":"permission_reply","id":"…","response":"once"|"always"|"reject"}
+```
+
+- `permission_reply` lines are never chat prompts.
+- Plain text lines during an in-flight stream are queued as the next prompts.
+- `--auto` / `opencode-chat-auto-approve` skips the handshake (approve once).
 
 ## Emacs session files
 
@@ -37,6 +50,8 @@ Emacs always passes `--jsonl`. Prompts are **one line** each (`quit` / EOF / idl
 6. Process filters must `with-current-buffer (process-buffer proc)`.
 7. `flushSessionText` must emit only the **latest** assistant message.
 8. Persistent daemon on `:4097` must not be killed from `closeSpawnedServer()`.
+9. With `--jsonl`, permission asks use stdout/stdin JSONL — never silent reject.
+10. Stdin demux must keep reading during `streamResponse` so `permission_reply` can arrive.
 
 ## Known limitations
 

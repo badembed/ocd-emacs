@@ -3,7 +3,12 @@ import { fileURLToPath } from "node:url";
 import type { OpencodeClient, TextPartInput } from "@opencode-ai/sdk";
 import { abortActiveSession } from "./client";
 import { streamResponse } from "./stream";
-import type { PermissionMode } from "./permissions";
+import {
+  parsePermissionReply,
+  type PermissionMode,
+  type PermissionResponse,
+  type WaitPermissionReply,
+} from "./permissions";
 
 export type StreamLoopOptions = {
   /** Log reasoning + tool calls to stderr (`-v` / `OCD_VERBOSE`). */
@@ -30,12 +35,59 @@ export type StreamLoopOptions = {
  */
 let streamInFlight = false;
 
+type PermissionWaiter = {
+  resolve: (response: PermissionResponse) => void;
+  reject: (err: Error) => void;
+};
+
+/** Simple async FIFO for chat prompts (stdin demux). */
+class PromptQueue {
+  private readonly items: string[] = [];
+  private readonly waiters: Array<(line: string | null) => void> = [];
+  private closed = false;
+
+  push(line: string): void {
+    if (this.closed) return;
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(line);
+      return;
+    }
+    this.items.push(line);
+  }
+
+  /** Resolve with null when the queue is closed and empty. */
+  take(): Promise<string | null> {
+    if (this.items.length > 0) {
+      return Promise.resolve(this.items.shift()!);
+    }
+    if (this.closed) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      this.waiters.push(resolve);
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    while (this.waiters.length > 0) {
+      this.waiters.shift()!(null);
+    }
+  }
+}
+
 /**
  * Read prompts from stdin line-by-line and stream responses to stdout via
  * `streamResponse`. Exits cleanly on:
  *   - EOF (readline `close` event)
  *   - the `quit` keyword (case-insensitive, trimmed) on its own line
  *   - SIGINT or external `signal` abort with no stream in flight
+ *
+ * A single stdin reader stays active during in-flight streams so JSONL
+ * `permission_reply` lines can resolve permission waiters. Plain text lines
+ * received during a stream are queued as the next chat prompts.
  *
  * SIGINT / signal abort during an in-flight stream calls
  * `abortActiveSession()` to abort the current stream without killing the
@@ -51,6 +103,60 @@ export async function runStreamLoop(
   const { verbose, permissionMode, signal } = options;
   const jsonl = options.jsonl === true;
 
+  const promptQueue = new PromptQueue();
+  const pendingPermissionReplies = new Map<string, PermissionWaiter>();
+
+  const waitPermissionReply: WaitPermissionReply = (id, replySignal) => {
+    return new Promise<PermissionResponse>((resolve, reject) => {
+      if (replySignal?.aborted || signal.aborted) {
+        reject(new Error("aborted"));
+        return;
+      }
+      if (pendingPermissionReplies.has(id)) {
+        process.stderr.write(
+          `warning: duplicate waitPermissionReply for ${id}\n`,
+        );
+        reject(new Error(`duplicate permission wait for ${id}`));
+        return;
+      }
+
+      const cleanup = (): void => {
+        pendingPermissionReplies.delete(id);
+        replySignal?.removeEventListener("abort", onAbort);
+        signal.removeEventListener("abort", onAbort);
+      };
+
+      const onAbort = (): void => {
+        const waiter = pendingPermissionReplies.get(id);
+        if (!waiter) return;
+        cleanup();
+        waiter.reject(new Error("aborted"));
+      };
+
+      pendingPermissionReplies.set(id, {
+        resolve: (response) => {
+          cleanup();
+          resolve(response);
+        },
+        reject: (err) => {
+          cleanup();
+          reject(err);
+        },
+      });
+
+      replySignal?.addEventListener("abort", onAbort, { once: true });
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+
+  const rejectAllPermissionWaiters = (reason: string): void => {
+    const waiters = [...pendingPermissionReplies.values()];
+    pendingPermissionReplies.clear();
+    for (const waiter of waiters) {
+      waiter.reject(new Error(reason));
+    }
+  };
+
   // output: process.stderr keeps stdout clean for streamed responses.
   const rl = createInterface({
     input: process.stdin,
@@ -62,27 +168,30 @@ export async function runStreamLoop(
   // never starts iterating because there is no data, and the for-await below
   // never receives the `end` event. The spawned OpenCode server keeps the
   // event loop alive, so the process hangs. Explicitly close readline on
-  // stdin end/close so the for-await terminates immediately.
-  process.stdin.on("end", () => {
+  // stdin end/close so the reader terminates immediately.
+  const onStdinEnd = (): void => {
     console.error("stream loop: stdin EOF, exiting");
     rl.close();
-  });
-  process.stdin.on("close", () => {
+  };
+  const onStdinClose = (): void => {
     console.error("stream loop: stdin closed, exiting");
     rl.close();
-  });
+  };
+  process.stdin.on("end", onStdinEnd);
+  process.stdin.on("close", onStdinClose);
 
   // Tracks whether the current stream rejection came from our interrupt path
   // (SIGINT / signal abort) vs. a real error. Local to this invocation; the
   // handler closure captures it. Reset on every interrupt and after each
   // stream so a subsequent genuine error still propagates.
   let userInitiatedAbort = false;
+  let shuttingDown = false;
 
   /**
    * Shared interrupt handler. SIGINT and external signal abort both route
    * here so the behavior stays in sync. If a stream is in-flight, abort it
    * and let the loop continue to the next prompt. Otherwise, close readline
-   * so the for-await ends and the function returns.
+   * so the demux ends and the function returns.
    */
   const handleInterrupt = (source: "SIGINT" | "signal"): void => {
     if (streamInFlight) {
@@ -90,10 +199,14 @@ export async function runStreamLoop(
         `stream loop: ${source} received, aborting current stream`,
       );
       userInitiatedAbort = true;
+      rejectAllPermissionWaiters("aborted");
       abortActiveSession();
       return;
     }
     console.error(`stream loop: ${source} received, exiting`);
+    shuttingDown = true;
+    rejectAllPermissionWaiters("aborted");
+    promptQueue.close();
     rl.close();
   };
 
@@ -103,6 +216,61 @@ export async function runStreamLoop(
   process.on("SIGINT", onSigint);
   signal.addEventListener("abort", onAbort);
 
+  // Always-on stdin demux: permission replies resolve waiters; other lines
+  // become chat prompts (queued even while a stream is in flight).
+  rl.on("line", (raw) => {
+    const line = raw.trim();
+    if (line.length === 0) return;
+
+    const reply = parsePermissionReply(line);
+    if (reply) {
+      const waiter = pendingPermissionReplies.get(reply.id);
+      if (!waiter) {
+        process.stderr.write(
+          `warning: permission_reply for unknown id ${reply.id}\n`,
+        );
+        return;
+      }
+      // Malformed response values are already normalized to reject by parser.
+      waiter.resolve(reply.response);
+      return;
+    }
+
+    // Control-looking JSON must never become a chat prompt.
+    if (line.startsWith("{")) {
+      try {
+        const obj = JSON.parse(line) as { type?: unknown };
+        if (typeof obj.type === "string") {
+          if (obj.type !== "permission_reply") {
+            process.stderr.write(
+              `warning: ignoring unknown control JSON type ${obj.type}\n`,
+            );
+          }
+          return;
+        }
+      } catch {
+        // Not JSON — treat as a chat prompt below.
+      }
+    }
+
+    if (line.toLowerCase() === "quit") {
+      console.error("stream loop: quit received, exiting");
+      shuttingDown = true;
+      rejectAllPermissionWaiters("aborted");
+      promptQueue.close();
+      rl.close();
+      return;
+    }
+
+    promptQueue.push(line);
+  });
+
+  rl.on("close", () => {
+    shuttingDown = true;
+    rejectAllPermissionWaiters("aborted");
+    promptQueue.close();
+  });
+
   // Announce the OpenCode session id once so Emacs can persist it.
   if (jsonl) {
     process.stdout.write(
@@ -111,13 +279,10 @@ export async function runStreamLoop(
   }
 
   try {
-    for await (const raw of rl) {
-      const line = raw.trim();
-      if (line.length === 0) continue;
-      if (line.toLowerCase() === "quit") {
-        console.error("stream loop: quit received, exiting");
-        break;
-      }
+    while (!shuttingDown) {
+      const line = await promptQueue.take();
+      if (line === null) break;
+
       const parts: TextPartInput[] = [{ type: "text", text: line }];
       streamInFlight = true;
       try {
@@ -125,6 +290,7 @@ export async function runStreamLoop(
           verbose,
           permissionMode,
           jsonl,
+          waitPermissionReply,
         });
       } catch (err: unknown) {
         if (userInitiatedAbort) {
@@ -136,6 +302,7 @@ export async function runStreamLoop(
         }
       } finally {
         streamInFlight = false;
+        rejectAllPermissionWaiters("aborted");
       }
     }
   } finally {
@@ -143,6 +310,10 @@ export async function runStreamLoop(
     // doesn't leak handlers or fire a stale abort on a new loop.
     process.removeListener("SIGINT", onSigint);
     signal.removeEventListener("abort", onAbort);
+    process.stdin.removeListener("end", onStdinEnd);
+    process.stdin.removeListener("close", onStdinClose);
+    rejectAllPermissionWaiters("aborted");
+    promptQueue.close();
     rl.close();
   }
 }

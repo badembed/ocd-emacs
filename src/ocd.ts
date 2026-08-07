@@ -36,7 +36,7 @@ program
   .option("-n, --name <name>", "session name (required with --stream)")
   .option(
     "--jsonl",
-    "with --stream, emit JSON Lines (session_id/text) for machine clients",
+    "with --stream, emit JSON Lines (session_id/text/permission) for machine clients",
   );
 
 program.parse();
@@ -98,15 +98,17 @@ async function main(): Promise<number> {
       opts.verbose === true ||
       process.env.OCD_VERBOSE === "1" ||
       process.env.OCD_VERBOSE === "true";
+    const jsonl = opts.jsonl === true;
     const permissionMode = resolvePermissionMode({
       autoFlag: opts.auto === true,
+      jsonlFlag: jsonl,
     });
     const controller = new AbortController();
     await runStreamLoop(client, sessionID, {
       signal: controller.signal,
       verbose,
       permissionMode,
-      jsonl: opts.jsonl === true,
+      jsonl,
     });
     return 0;
   }
