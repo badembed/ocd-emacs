@@ -1,4 +1,5 @@
 import {
+  existsSync,
   readFileSync,
   readSync,
   openSync,
@@ -11,6 +12,18 @@ import clipboardy from "clipboardy";
 
 /** Files larger than this are sent as path + metadata, not full contents. */
 export const INLINE_MAX_BYTES = 4 * 1024;
+
+/** Path-only attachment from Emacs `@buffer` mentions (JSONL `prompt`). */
+export type StreamAttachment = {
+  name: string;
+  path: string;
+};
+
+/** One multi-turn stream prompt, optionally with file path attachments. */
+export type StreamPromptTurn = {
+  text: string;
+  attachments: StreamAttachment[];
+};
 
 export type Workspace = {
   /** OpenCode project root (x-opencode-directory). */
@@ -85,6 +98,88 @@ export function assembleParts(
 
   parts.push({ type: "text", text: question });
   return parts;
+}
+
+/**
+ * Build stream-turn parts: path attachments (via disk `filePart`) then question.
+ * Missing paths are skipped with a stderr warning. No attachment `content`
+ * field — OpenCode reads/edits files on disk.
+ */
+export function assembleStreamParts(
+  text: string,
+  attachments: StreamAttachment[] = [],
+): TextPartInput[] {
+  const question = text.trim();
+  if (!question) {
+    throw new Error("question required");
+  }
+
+  const parts: TextPartInput[] = [];
+  for (const att of attachments) {
+    const path = typeof att.path === "string" ? att.path.trim() : "";
+    if (!path) {
+      console.error(
+        `warning: attachment "${att.name || "?"}" missing path, skipping`,
+      );
+      continue;
+    }
+    if (!existsSync(path)) {
+      console.error(`warning: attachment path not found, skipping: ${path}`);
+      continue;
+    }
+    try {
+      const st = statSync(path);
+      if (!st.isFile()) {
+        console.error(`warning: attachment is not a file, skipping: ${path}`);
+        continue;
+      }
+      parts.push(filePart(path, st.size));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`warning: cannot attach ${path} (${msg}), skipping`);
+    }
+  }
+  parts.push({ type: "text", text: question });
+  return parts;
+}
+
+/**
+ * Parse a JSONL stdin control line for structured prompts.
+ * Returns undefined when the line is not a `prompt` object.
+ */
+export function parsePromptTurn(line: string): StreamPromptTurn | undefined {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type !== "prompt") return undefined;
+  if (typeof obj.text !== "string" || obj.text.trim().length === 0) {
+    console.error("warning: prompt JSON missing non-empty text, ignoring");
+    return undefined;
+  }
+
+  const attachments: StreamAttachment[] = [];
+  if (Array.isArray(obj.attachments)) {
+    for (const raw of obj.attachments) {
+      if (typeof raw !== "object" || raw === null) continue;
+      const a = raw as Record<string, unknown>;
+      const path = typeof a.path === "string" ? a.path.trim() : "";
+      if (!path) continue;
+      const name =
+        typeof a.name === "string" && a.name.trim().length > 0
+          ? a.name.trim()
+          : path;
+      attachments.push({ name, path });
+    }
+  }
+
+  return { text: obj.text.trim(), attachments };
 }
 
 function filePart(path: string, size: number): TextPartInput {

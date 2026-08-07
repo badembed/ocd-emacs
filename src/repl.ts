@@ -1,7 +1,12 @@
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import type { OpencodeClient, TextPartInput } from "@opencode-ai/sdk";
+import type { OpencodeClient } from "@opencode-ai/sdk";
 import { abortActiveSession } from "./client";
+import {
+  assembleStreamParts,
+  parsePromptTurn,
+  type StreamPromptTurn,
+} from "./context";
 import { streamResponse } from "./stream";
 import {
   parsePermissionReply,
@@ -42,22 +47,23 @@ type PermissionWaiter = {
 
 /** Simple async FIFO for chat prompts (stdin demux). */
 class PromptQueue {
-  private readonly items: string[] = [];
-  private readonly waiters: Array<(line: string | null) => void> = [];
+  private readonly items: StreamPromptTurn[] = [];
+  private readonly waiters: Array<(turn: StreamPromptTurn | null) => void> =
+    [];
   private closed = false;
 
-  push(line: string): void {
+  push(turn: StreamPromptTurn): void {
     if (this.closed) return;
     const waiter = this.waiters.shift();
     if (waiter) {
-      waiter(line);
+      waiter(turn);
       return;
     }
-    this.items.push(line);
+    this.items.push(turn);
   }
 
   /** Resolve with null when the queue is closed and empty. */
-  take(): Promise<string | null> {
+  take(): Promise<StreamPromptTurn | null> {
     if (this.items.length > 0) {
       return Promise.resolve(this.items.shift()!);
     }
@@ -87,7 +93,7 @@ class PromptQueue {
  *
  * A single stdin reader stays active during in-flight streams so JSONL
  * `permission_reply` lines can resolve permission waiters. Plain text lines
- * received during a stream are queued as the next chat prompts.
+ * and JSONL `prompt` turns are queued as the next chat prompts.
  *
  * SIGINT / signal abort during an in-flight stream calls
  * `abortActiveSession()` to abort the current stream without killing the
@@ -216,8 +222,8 @@ export async function runStreamLoop(
   process.on("SIGINT", onSigint);
   signal.addEventListener("abort", onAbort);
 
-  // Always-on stdin demux: permission replies resolve waiters; other lines
-  // become chat prompts (queued even while a stream is in flight).
+  // Always-on stdin demux: permission replies resolve waiters; prompt JSON /
+  // plain text become chat turns (queued even while a stream is in flight).
   rl.on("line", (raw) => {
     const line = raw.trim();
     if (line.length === 0) return;
@@ -231,21 +237,24 @@ export async function runStreamLoop(
         );
         return;
       }
-      // Malformed response values are already normalized to reject by parser.
       waiter.resolve(reply.response);
       return;
     }
 
-    // Control-looking JSON must never become a chat prompt.
+    const promptTurn = parsePromptTurn(line);
+    if (promptTurn) {
+      promptQueue.push(promptTurn);
+      return;
+    }
+
+    // Other control-looking JSON must never become a chat prompt.
     if (line.startsWith("{")) {
       try {
         const obj = JSON.parse(line) as { type?: unknown };
         if (typeof obj.type === "string") {
-          if (obj.type !== "permission_reply") {
-            process.stderr.write(
-              `warning: ignoring unknown control JSON type ${obj.type}\n`,
-            );
-          }
+          process.stderr.write(
+            `warning: ignoring unknown control JSON type ${obj.type}\n`,
+          );
           return;
         }
       } catch {
@@ -262,7 +271,7 @@ export async function runStreamLoop(
       return;
     }
 
-    promptQueue.push(line);
+    promptQueue.push({ text: line, attachments: [] });
   });
 
   rl.on("close", () => {
@@ -280,10 +289,18 @@ export async function runStreamLoop(
 
   try {
     while (!shuttingDown) {
-      const line = await promptQueue.take();
-      if (line === null) break;
+      const turn = await promptQueue.take();
+      if (turn === null) break;
 
-      const parts: TextPartInput[] = [{ type: "text", text: line }];
+      let parts;
+      try {
+        parts = assembleStreamParts(turn.text, turn.attachments);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`stream loop: bad prompt (${msg})`);
+        continue;
+      }
+
       streamInFlight = true;
       try {
         await streamResponse(client, sessionID, parts, {
@@ -318,16 +335,16 @@ export async function runStreamLoop(
   }
 }
 
-// Minimal CLI for exercising runStreamLoop in isolation (todo 3 verification).
+// Minimal CLI for exercising runStreamLoop in isolation.
 // Real wiring — client resolution, session management, commander flags — lives
-// in src/ocd.ts (todo 4). This stub exists only so `bun run src/repl.ts`
-// drives the loop end-to-end during automated checks; importing this module
-// from another file (e.g. ocd.ts) does NOT trigger the loop.
+// in src/ocd.ts. This stub exists only so `bun run src/repl.ts` drives the
+// loop end-to-end during automated checks; importing this module from another
+// file (e.g. ocd.ts) does NOT trigger the loop.
 const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
 if (isMainModule) {
   // Proxy that throws on every property access — streamResponse will fail
   // loudly, the loop will log the error and continue, and EOF / `quit` will
-  // exit cleanly. This is exactly what the todo 3 functional tests expect.
+  // exit cleanly.
   const stubClient = new Proxy({} as Record<string, unknown>, {
     get(_target, prop) {
       return () => {

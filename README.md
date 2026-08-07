@@ -132,6 +132,12 @@ When OpenCode asks for a permission, Emacs shows `read-multiple-choice`
 (`once` / `always` / `reject`) and replies over JSONL. With
 `opencode-chat-auto-approve` non-nil, `ocd` gets `--auto` and skips the prompt.
 
+**`@buffer` mentions:** typing `@` runs the same completion as `C-c @`
+(`completion-at-point` — Helm in Spacemacs). Needs at least one other
+**file-backed** buffer open. Manual: `C-c @` / `C-M-i`. On send, dirty buffers
+are saved and only paths are attached. Reload after update (`SPC q r`), then
+reopen the chat buffer.
+
 If the buffer says there is no subprocess, `opencode-chat-ocd-program` is wrong or not executable — check with `M-: (executable-find opencode-chat-ocd-program)`.
 
 ## CLI usage
@@ -159,13 +165,15 @@ ocd --stream --jsonl --name math
 
 Exit the loop with `quit`, stdin EOF, or idle SIGINT. Mid-stream SIGINT aborts the current answer and waits for the next prompt.
 
-With `--jsonl`, permission asks are machine-readable:
+With `--jsonl`, machine clients can use structured stdin/stdout:
 
 ```text
 ← {"type":"permission","id":"…","permission":"bash","title":"…"}
 → {"type":"permission_reply","id":"…","response":"once"}
+→ {"type":"prompt","text":"explain","attachments":[{"name":"foo.ts","path":"/abs/foo.ts"}]}
 ```
 
+Attachments are **path-only** (no file body). Plain one-line prompts still work.
 In a plain TTY `--stream` (no `--jsonl`), permissions use stderr prompts (`y`/`a`/`n`).
 
 | Flag | Meaning |
@@ -205,7 +213,7 @@ Sessions live in `~/.opencode-chat/sessions/<name>.md` (file-local vars at **end
 src/ocd.ts           CLI entry (commander)
 src/client.ts        OpenCode client / daemon
 src/sessions.ts      Named session store (~/.ocd/sessions.json)
-src/context.ts       Workspace + prompt parts
+src/context.ts       Workspace + prompt / attachment parts
 src/stream.ts        SSE streaming (+ optional JSONL)
 src/permissions.ts   Permission prompts
 src/errors.ts        SDK error formatting

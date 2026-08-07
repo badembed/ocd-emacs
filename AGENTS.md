@@ -33,6 +33,16 @@ Permission mode with `--jsonl` (unless `--auto`): stdin demux stays active durin
 - Plain text lines during an in-flight stream are queued as the next prompts.
 - `--auto` / `opencode-chat-auto-approve` skips the handshake (approve once).
 
+### JSONL prompt with path attachments (Emacs `@buffer`)
+
+```text
+→ {"type":"prompt","text":"explain this","attachments":[{"name":"foo.ts","path":"/abs/foo.ts"}]}
+```
+
+- Path-only attachments (no `content`); `ocd` reads files from disk via `assembleStreamParts`.
+- Emacs resolves `@buffer` mentions, saves dirty buffers, strips mentions from `text`.
+- Plain one-line prompts remain valid for terminal use.
+
 ## Emacs session files
 
 - Path: `~/.opencode-chat/sessions/<name>.md`

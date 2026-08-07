@@ -36,6 +36,7 @@
 ;;; Code:
 
 (require 'json)
+(require 'cl-lib)
 
 ;;;###autoload
 (defgroup opencode-chat nil
@@ -206,6 +207,164 @@ Newlines would otherwise each become a separate OpenCode turn."
   (string-trim
    (replace-regexp-in-string "[ \t\n\r]+" " " text)))
 
+(defun opencode-chat--file-backed-buffer-alist ()
+  "Return alist of (BUFFER-NAME . ABSOLUTE-PATH) for file-backed buffers.
+Skips the current buffer, internal space-prefixed names, and names that
+contain whitespace (unsupported in `@mentions')."
+  (let (result)
+    (dolist (buf (buffer-list))
+      (let ((name (buffer-name buf))
+            (file (buffer-file-name buf)))
+        (when (and file
+                   name
+                   (not (eq buf (current-buffer)))
+                   (not (string-prefix-p " " name))
+                   (not (string-match-p "[ \t\n\r]" name)))
+          (push (cons name (expand-file-name file)) result))))
+    result))
+
+(defun opencode-chat--mention-bounds ()
+  "Return (BEG END) of the `@buffer' prefix at point, or nil.
+BEG is the first character of the buffer-name prefix (right after `@');
+END is point.  Works with an empty prefix immediately after `@'."
+  (let ((end (point)))
+    (save-excursion
+      (skip-chars-backward "^ \t\n\r@")
+      (let ((beg (point)))
+        (when (eq (char-before) ?@)
+          (list beg end))))))
+
+(defun opencode-chat--completion-at-point ()
+  "Completion-at-point function for `@buffer' mentions.
+Offers file-backed buffer names after `@'."
+  (when-let ((bounds (opencode-chat--mention-bounds)))
+    (let* ((start (nth 0 bounds))
+           (end (nth 1 bounds))
+           (alist (opencode-chat--file-backed-buffer-alist))
+           (table (mapcar #'car alist)))
+      (list start end table
+            ;; Own the completion region so Company/Corfu don't mix in
+            ;; unrelated backends while typing after `@'.
+            :exclusive t
+            :company-prefix-length t
+            :annotation-function
+            (lambda (cand)
+              (let ((path (cdr (assoc cand alist))))
+                (when path
+                  (concat " " (abbreviate-file-name path)))))
+            :exit-function
+            (lambda (_string status)
+              (when (eq status 'finished)
+                (unless (eq (char-after) ?\s)
+                  (insert " "))))))))
+
+(defun opencode-chat--trigger-mention-completion ()
+  "Open buffer-name completion at point after `@'.
+Uses `completion-at-point' — the same path as `C-c @', which Spacemacs
+wires to Helm.  (Forcing Company here previously swallowed the UI.)"
+  (when (opencode-chat--mention-bounds)
+    (unless (opencode-chat--file-backed-buffer-alist)
+      (message "opencode-chat: no file-backed buffers to mention"))
+    (completion-at-point)))
+
+(defun opencode-chat-insert-at-mention ()
+  "Insert `@' and immediately offer file-backed buffer completion."
+  (interactive)
+  (insert "@")
+  (opencode-chat--trigger-mention-completion))
+
+(defun opencode-chat--maybe-complete-mention ()
+  "If `@' was typed via `self-insert-command', open mention completion.
+Backup for Evil/Spacemacs when the mode-map binding on `@' is shadowed."
+  (when (and (eq this-command 'self-insert-command)
+             (eq last-command-event ?@)
+             (eq (char-before) ?@)
+             (opencode-chat--mention-bounds))
+    ;; Defer so self-insert finishes before Helm/CAPF runs.
+    (run-at-time 0 nil #'opencode-chat--trigger-mention-completion)))
+
+(defun opencode-chat--setup-mention-completion ()
+  "Install `@buffer' CAPF and bind `@' to mention completion."
+  (add-hook 'completion-at-point-functions
+            #'opencode-chat--completion-at-point nil t)
+  (add-hook 'post-self-insert-hook
+            #'opencode-chat--maybe-complete-mention nil t)
+  ;; TAB tries completion when indent doesn't apply (plain text chat).
+  (setq-local tab-always-indent 'complete)
+  (setq-local completion-auto-help t)
+  ;; Bind `@' for Emacs and Evil insert (Spacemacs).
+  (define-key opencode-chat-mode-map (kbd "@") #'opencode-chat-insert-at-mention)
+  (when (fboundp 'evil-define-key)
+    (evil-define-key 'insert opencode-chat-mode-map
+      (kbd "@") #'opencode-chat-insert-at-mention)
+    (when (fboundp 'evil-normalize-keymaps)
+      (evil-normalize-keymaps)))
+  (when (and (featurep 'evil)
+             (fboundp 'evil-local-set-key)
+             (bound-and-true-p evil-local-mode))
+    (evil-local-set-key 'insert (kbd "@") #'opencode-chat-insert-at-mention)))
+
+(defun opencode-chat--parse-mentions (text)
+  "Parse `@buffer' mentions in TEXT.
+Return (CLEAN-TEXT . ATTACHMENTS) where ATTACHMENTS is a list of
+plists (:name NAME :path PATH :buffer BUFFER).  Unknown `@token'
+signals `user-error'.  Mentions are removed from CLEAN-TEXT."
+  (let* ((alist (opencode-chat--file-backed-buffer-alist))
+         (names (sort (mapcar #'car alist)
+                      (lambda (a b) (> (length a) (length b)))))
+         (attachments nil)
+         (len (length text))
+         (pos 0)
+         (chunks nil))
+    (while (< pos len)
+      (if (/= (aref text pos) ?@)
+          (let ((next (or (cl-position ?@ text :start (1+ pos)) len)))
+            (push (substring text pos next) chunks)
+            (setq pos next))
+        (let ((matched nil))
+          (dolist (name names)
+            (unless matched
+              (let* ((nlen (length name))
+                     (end (+ pos 1 nlen)))
+                (when (and (<= end len)
+                           (string= name (substring text (1+ pos) end))
+                           (or (= end len)
+                               (memq (aref text end) '(?\s ?\t ?\n ?\r))))
+                  (setq matched name)))))
+          (if (null matched)
+              (let ((end (1+ pos)))
+                (while (and (< end len)
+                            (not (memq (aref text end) '(?\s ?\t ?\n ?\r))))
+                  (setq end (1+ end)))
+                (user-error "opencode-chat-send: unknown @mention %s"
+                            (substring text pos end)))
+            (let* ((path (cdr (assoc matched alist)))
+                   (buf (get-buffer matched)))
+              (unless (and path buf)
+                (user-error "opencode-chat-send: buffer %s is not file-backed"
+                            matched))
+              (push (list :name matched :path path :buffer buf) attachments)
+              (push " " chunks)
+              (setq pos (+ pos 1 (length matched))))))))
+    (cons (apply #'concat (nreverse chunks))
+          (nreverse attachments))))
+
+(defun opencode-chat--save-mention-buffers (attachments)
+  "Save dirty buffers referenced by ATTACHMENTS before sending paths.
+Each attachment is a plist with `:buffer'.  Signals `user-error' if a
+save fails."
+  (dolist (att attachments)
+    (let ((buf (plist-get att :buffer)))
+      (when (and buf (buffer-live-p buf))
+        (with-current-buffer buf
+          (when (buffer-modified-p)
+            (condition-case err
+                (save-buffer)
+              (error
+               (user-error "opencode-chat-send: failed to save %s: %s"
+                           (buffer-name buf)
+                           (error-message-string err))))))))))
+
 (defun opencode-chat--remove-local-variables-section ()
   "Delete every `Local Variables' / `End:' block in the buffer.
 Used before rewriting a single trailing block so legacy header
@@ -230,8 +389,10 @@ through the end of the chat body (not merely through point).  This
 matters in Evil normal state, where point often rests on the last
 response character while the follow-up was typed at EOB.
 
-The prompt is normalized to a single line: `ocd --stream' reads
-stdin line-by-line, so embedded newlines would enqueue extra turns."
+`@buffer' mentions (file-backed buffers) are resolved to absolute
+paths: dirty buffers are saved, mentions are stripped from the
+question, and a JSONL `prompt' line with path-only attachments is
+sent.  Without mentions, a plain one-line prompt is sent as before."
   (interactive)
   (unless (and (boundp 'opencode-chat--process)
                opencode-chat--process)
@@ -244,13 +405,32 @@ stdin line-by-line, so embedded newlines would enqueue extra turns."
          (beg (if use-region
                   (region-beginning)
                 (opencode-chat--prompt-beg end)))
-         (prompt (opencode-chat--normalize-prompt
-                  (if (< beg end)
-                      (buffer-substring-no-properties beg end)
-                    ""))))
-    (when (string-empty-p prompt)
+         (raw (if (< beg end)
+                  (buffer-substring-no-properties beg end)
+                ""))
+         (parsed (opencode-chat--parse-mentions raw))
+         (clean (opencode-chat--normalize-prompt (car parsed)))
+         (attachments (cdr parsed))
+         line)
+    (when (string-empty-p clean)
       (user-error "opencode-chat-send: nothing to send"))
-    (process-send-string opencode-chat--process (concat prompt "\n"))
+    (when attachments
+      (opencode-chat--save-mention-buffers attachments))
+    (setq line
+          (if attachments
+              (concat
+               (json-encode
+                `((type . "prompt")
+                  (text . ,clean)
+                  (attachments
+                   . ,(mapcar
+                       (lambda (att)
+                         `((name . ,(plist-get att :name))
+                           (path . ,(plist-get att :path))))
+                       attachments))))
+               "\n")
+            (concat clean "\n")))
+    (process-send-string opencode-chat--process line)
     (opencode-chat--goto-body-end)
     (unless (eq (char-before) ?\n)
       (insert "\n"))
@@ -528,6 +708,8 @@ Each entry is a plist (:id ID :permission TYPE :title TITLE :patterns LIST).")
     (define-key map (kbd "C-c C-k") #'opencode-chat-abort)
     (define-key map (kbd "C-c C-r") #'opencode-chat-rename-session)
     (define-key map (kbd "C-c C-l") #'opencode-chat-list-sessions)
+    (define-key map (kbd "C-c @") #'completion-at-point)
+    (define-key map (kbd "C-M-i") #'completion-at-point)
     map)
   "Keymap for `opencode-chat-mode'.")
 
@@ -599,6 +781,8 @@ before our setup completes."
     (setq major-mode 'opencode-chat-mode)
     (setq mode-name "OpenCode-Chat")
     (use-local-map opencode-chat-mode-map)
+    ;; `@buffer' completion for file-backed buffers (CAPF + Company/Corfu).
+    (opencode-chat--setup-mention-completion)
     ;; Initialize buffer-local state.  The variables are already
     ;; buffer-local (via `make-variable-buffer-local'), so plain `setq'
     ;; sets the buffer-local value.  Restore from saved values where
@@ -630,6 +814,11 @@ before our setup completes."
     (add-hook 'write-file-functions #'opencode-chat--save-state nil t)
     (add-hook 'opencode-chat-mode-hook #'opencode-chat--restore-state nil t)
     (run-mode-hooks 'opencode-chat-mode-hook)
+    ;; Re-assert Evil `@' binding after mode hooks / evil keymaps settle.
+    (when (and (featurep 'evil)
+               (fboundp 'evil-local-set-key)
+               (bound-and-true-p evil-local-mode))
+      (evil-local-set-key 'insert (kbd "@") #'opencode-chat-insert-at-mention))
     ;; Start the subprocess once the mode is fully initialized, but only
     ;; when a session name is already known AND no process is already
     ;; running.  `opencode-chat--restore-state' (from the hook above)
