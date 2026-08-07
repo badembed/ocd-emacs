@@ -33,7 +33,11 @@ program
     "--stream",
     "read prompts from stdin, stream responses to stdout (multi-turn)",
   )
-  .option("-n, --name <name>", "session name (required with --stream)");
+  .option("-n, --name <name>", "session name (required with --stream)")
+  .option(
+    "--jsonl",
+    "with --stream, emit JSON Lines (session_id/text) for machine clients",
+  );
 
 program.parse();
 
@@ -45,6 +49,7 @@ const opts = program.opts<{
   listSessions?: boolean;
   stream?: boolean;
   name?: string;
+  jsonl?: boolean;
 }>();
 const args: string[] = program.args;
 
@@ -101,6 +106,7 @@ async function main(): Promise<number> {
       signal: controller.signal,
       verbose,
       permissionMode,
+      jsonl: opts.jsonl === true,
     });
     return 0;
   }

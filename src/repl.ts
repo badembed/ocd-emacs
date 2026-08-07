@@ -16,6 +16,11 @@ export type StreamLoopOptions = {
    * one is in flight, otherwise exit the loop cleanly.
    */
   signal: AbortSignal;
+  /**
+   * Emit JSON Lines on stdout for machine clients (Emacs). Opt-in via
+   * `ocd --stream --jsonl`; plain text remains the default for humans.
+   */
+  jsonl?: boolean;
 };
 
 /**
@@ -44,6 +49,7 @@ export async function runStreamLoop(
   options: StreamLoopOptions,
 ): Promise<void> {
   const { verbose, permissionMode, signal } = options;
+  const jsonl = options.jsonl === true;
 
   // output: process.stderr keeps stdout clean for streamed responses.
   const rl = createInterface({
@@ -97,6 +103,13 @@ export async function runStreamLoop(
   process.on("SIGINT", onSigint);
   signal.addEventListener("abort", onAbort);
 
+  // Announce the OpenCode session id once so Emacs can persist it.
+  if (jsonl) {
+    process.stdout.write(
+      JSON.stringify({ type: "session_id", id: sessionID }) + "\n",
+    );
+  }
+
   try {
     for await (const raw of rl) {
       const line = raw.trim();
@@ -111,6 +124,7 @@ export async function runStreamLoop(
         await streamResponse(client, sessionID, parts, {
           verbose,
           permissionMode,
+          jsonl,
         });
       } catch (err: unknown) {
         if (userInitiatedAbort) {

@@ -13,7 +13,31 @@ export type StreamOptions = {
   verbose?: boolean;
   /** How to answer OpenCode permission.updated prompts. */
   permissionMode?: PermissionMode;
+  /**
+   * Emit assistant text as JSON Lines for machine clients (Emacs
+   * `opencode-chat.el`). Each chunk becomes
+   * `{"type":"text","text":"..."}\n`. Plain CLI mode (default) keeps
+   * raw text on stdout.
+   */
+  jsonl?: boolean;
 };
+
+/** Write assistant text to stdout in plain or JSONL form. */
+function writeStdoutText(text: string, jsonl: boolean): void {
+  if (!text) return;
+  if (jsonl) {
+    process.stdout.write(JSON.stringify({ type: "text", text }) + "\n");
+  } else {
+    process.stdout.write(text);
+  }
+}
+
+/** Terminate a plain-text response; no-op in JSONL mode (each event is a line). */
+function writeStdoutEnd(jsonl: boolean): void {
+  if (!jsonl) {
+    process.stdout.write("\n");
+  }
+}
 
 /**
  * Send a prompt via `promptAsync` and stream the answer to stdout via SSE.
@@ -26,6 +50,7 @@ export async function streamResponse(
   options: StreamOptions = {},
 ): Promise<void> {
   const verbose = options.verbose === true;
+  const jsonl = options.jsonl === true;
   const permissionMode: PermissionMode =
     options.permissionMode ?? "reject";
   const controller = new AbortController();
@@ -49,7 +74,7 @@ export async function streamResponse(
       console.error(
         `warning: event subscribe failed (${msg}), using batch mode`,
       );
-      await batchPrompt(client, sessionID, parts);
+      await batchPrompt(client, sessionID, parts, jsonl);
       return;
     }
 
@@ -70,7 +95,7 @@ export async function streamResponse(
         console.error(
           `warning: promptAsync unavailable (${msg}), using batch mode`,
         );
-        await batchPrompt(client, sessionID, parts);
+        await batchPrompt(client, sessionID, parts, jsonl);
         return;
       }
       throw err instanceof Error ? err : new Error(String(err));
@@ -120,7 +145,7 @@ export async function streamResponse(
         process.stderr.write("\n");
         reasoningOpen = false;
       }
-      process.stdout.write(chunk);
+      writeStdoutText(chunk, jsonl);
       seenText.set(partID, (seenText.get(partID) ?? "") + chunk);
       sawAssistantText = true;
     };
@@ -328,9 +353,9 @@ export async function streamResponse(
       }
       // Role/text events can race; if SSE printed nothing, pull final assistant text.
       if (!sawAssistantText) {
-        await flushSessionText(client, sessionID);
+        await flushSessionText(client, sessionID, jsonl);
       } else {
-        process.stdout.write("\n");
+        writeStdoutEnd(jsonl);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -340,9 +365,9 @@ export async function streamResponse(
           .abort({ path: { id: sessionID } })
           .catch(() => {});
         if (!sawAssistantText) {
-          await flushSessionText(client, sessionID);
+          await flushSessionText(client, sessionID, jsonl);
         } else {
-          process.stdout.write("\n");
+          writeStdoutEnd(jsonl);
         }
         throw new Error(
           `${msg}\n` +
@@ -367,6 +392,7 @@ async function batchPrompt(
   client: OpencodeClient,
   sessionID: string,
   parts: TextPartInput[],
+  jsonl = false,
 ): Promise<void> {
   const result = await client.session.prompt({
     path: { id: sessionID },
@@ -382,11 +408,11 @@ async function batchPrompt(
         part.synthetic !== true &&
         part.ignored !== true
       ) {
-        process.stdout.write(part.text);
+        writeStdoutText(part.text, jsonl);
       }
     }
   }
-  process.stdout.write("\n");
+  writeStdoutEnd(jsonl);
 }
 
 const TOOL_LOG_MAX = 800;
@@ -450,23 +476,29 @@ function formatToolError(
   return `[tool:${tool}] error ${ms}ms\n  ${truncateLog(state.error)}\n`;
 }
 
-/** Best-effort dump of assistant text if SSE ended early / timed out. */
+/** Best-effort dump of the latest assistant text if SSE ended early / timed out.
+ * Only the most recent assistant message is written — dumping the full
+ * multi-turn history would replay prior answers into `--stream` clients.
+ */
 async function flushSessionText(
   client: OpencodeClient,
   sessionID: string,
+  jsonl = false,
 ): Promise<void> {
   try {
     const msgs = await client.session.messages({ path: { id: sessionID } });
     if (msgs.error || !msgs.data) return;
-    for (const msg of msgs.data) {
+    for (let i = msgs.data.length - 1; i >= 0; i--) {
+      const msg = msgs.data[i];
       if (msg.info.role !== "assistant") continue;
       for (const part of msg.parts) {
         if (part.type === "text" && part.text) {
-          process.stdout.write(part.text);
+          writeStdoutText(part.text, jsonl);
         }
       }
+      writeStdoutEnd(jsonl);
+      return;
     }
-    process.stdout.write("\n");
   } catch {
     // ignore flush failures
   }

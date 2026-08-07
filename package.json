@@ -1,19 +1,29 @@
 {
   "name": "ocd",
+  "version": "0.1.0",
   "private": true,
+  "description": "CLI wrapper for the OpenCode Agent SDK, with an optional Emacs chat front-end",
   "type": "module",
+  "bin": {
+    "ocd": "./dist/ocd"
+  },
   "scripts": {
     "build": "bun build src/ocd.ts --compile --outfile dist/ocd",
     "build:mac-arm": "bun build src/ocd.ts --compile --target bun-darwin-arm64-modern --outfile dist/ocd-darwin-arm64",
     "build:mac-x64": "bun build src/ocd.ts --compile --target bun-darwin-x64-modern --outfile dist/ocd-darwin-x64",
     "build:linux-x64": "bun build src/ocd.ts --compile --target bun-linux-x64-modern --outfile dist/ocd-linux-x64",
     "build:linux-arm64": "bun build src/ocd.ts --compile --target bun-linux-arm64-modern --outfile dist/ocd-linux-arm64",
-    "build:all": "bun run build:mac-arm && bun run build:mac-x64 && bun run build:linux-x64 && bun run build:linux-arm64"
+    "build:all": "bun run build:mac-arm && bun run build:mac-x64 && bun run build:linux-x64 && bun run build:linux-arm64",
+    "start": "bun run src/ocd.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.18.0",
-    "commander": "^14.0.0",
-    "clipboardy": "^4.0.0"
+    "clipboardy": "^4.0.0",
+    "commander": "^14.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

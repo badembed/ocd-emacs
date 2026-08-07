@@ -2,3 +2,7 @@ node_modules/
 dist/
 .omo/
 *.elc
+.DS_Store
+*.log
+.env
+.env.*

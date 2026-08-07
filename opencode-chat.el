@@ -73,11 +73,165 @@ more verbose output (interpretation is implementation-defined)."
 
 ;;; Command stubs (real implementations land in todos 8-15).
 
+(defun opencode-chat--local-variables-start ()
+  "Return the start of the trailing `Local Variables' block, or nil.
+A block counts only when nothing but whitespace follows its `;; End:'
+line — so a legacy header block above the transcript is ignored and
+the chat body still extends to `point-max'."
+  (save-excursion
+    (goto-char (point-max))
+    (when (re-search-backward "^;; Local Variables:\\s-*$" nil t)
+      (let ((beg (match-beginning 0)))
+        (goto-char beg)
+        (when (and (re-search-forward "^;; End:\\s-*$" nil t)
+                   (progn (forward-line 1) t)
+                   (looking-at-p "\\s-*\\'"))
+          beg)))))
+
+(defun opencode-chat--body-end ()
+  "Return the end of the editable chat body (before Local Variables)."
+  (or (opencode-chat--local-variables-start) (point-max)))
+
+(defun opencode-chat--body-beg ()
+  "Return the start of the editable chat body (after the header).
+Never returns a position inside the trailing Local Variables block —
+an empty body starts on the blank line immediately before it."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((end (opencode-chat--body-end)))
+      (cond
+       ((re-search-forward
+         ;; Use [ \t]* not \\s-* — the latter matches newlines and would
+         ;; leave point on the following blank line, so forward-line
+         ;; skips into `;; Local Variables:'.
+         "^Type your message and press `C-c C-c` to send\\.[ \t]*$"
+         end t)
+        (forward-line 1)
+        ;; Do not skip blank lines onto the Local Variables line; typing
+        ;; there would corrupt `^;; Local Variables:' and break restore.
+        (min (point) end))
+       ;; Legacy files with Local Variables under the header: body after
+       ;; the first `;; End:' that closes that header block.
+       ((re-search-forward "^;; End:[ \t]*$" end t)
+        (forward-line 1)
+        (min (point) end))
+       (t (point-min))))))
+
+(defun opencode-chat--goto-body-end ()
+  "Move point to the end of the chat body (before Local Variables).
+Ensures a newline separates the body from the Local Variables block
+so inserts never prefix the `;; Local Variables:' line."
+  (let ((lv (opencode-chat--local-variables-start)))
+    (goto-char (or lv (point-max)))
+    (when (and lv
+               (or (= (point) (point-min))
+                   (not (eq (char-before) ?\n))))
+      (insert "\n"))))
+
+(defun opencode-chat--last-response-end (&optional limit)
+  "Return the end position of the last `opencode-response' run.
+Search is limited to LIMIT (default body end).  Returns nil when
+no response text exists at or before LIMIT.
+
+Text properties move with edits, so this stays correct even if the
+integer snapshot in `opencode-chat--bounds' is stale."
+  (let* ((limit (min (or limit (opencode-chat--body-end)) (point-max)))
+         (pos limit))
+    (when (> pos (point-min))
+      (unless (get-text-property (1- pos) 'opencode-response)
+        (setq pos (or (previous-single-property-change
+                       pos 'opencode-response nil (point-min))
+                      (point-min))))
+      (when (and (> pos (point-min))
+                 (get-text-property (1- pos) 'opencode-response))
+        (or (next-single-property-change (1- pos) 'opencode-response
+                                         nil limit)
+            limit)))))
+
+(defun opencode-chat--collect-response-bounds ()
+  "Return ((BEG . END) ...) for every `opencode-response' run in the body.
+Used when persisting `opencode-chat--bounds' so the file-local snapshot
+matches the live text properties after edits."
+  (let ((pos (opencode-chat--body-beg))
+        (max (opencode-chat--body-end))
+        bounds)
+    (while (< pos max)
+      (if (get-text-property pos 'opencode-response)
+          (let ((end (or (next-single-property-change
+                          pos 'opencode-response nil max)
+                         max)))
+            (push (cons pos end) bounds)
+            (setq pos end))
+        (setq pos (or (next-single-property-change
+                       pos 'opencode-response nil max)
+                      max))))
+    (nreverse bounds)))
+
+(defun opencode-chat--response-run-markers ()
+  "Return ((BEG-MARKER . END-MARKER) ...) for each response run.
+BEG markers are non-advancing; END markers advance on insert, so
+rewriting the Local Variables block can be followed by a stable
+re-read of positions via `marker-position'."
+  (mapcar
+   (lambda (pair)
+     (cons (copy-marker (car pair) nil)
+           (copy-marker (cdr pair) t)))
+   (opencode-chat--collect-response-bounds)))
+
+(defun opencode-chat--prompt-beg (end)
+  "Return the start of the user prompt ending at END.
+
+Live source of truth is the `opencode-response' text-property (via
+`opencode-chat--last-response-end'), combined with
+`opencode-chat--prompt-marker' so a just-sent prompt is not resent.
+Falls back to `opencode-chat--body-beg' for a fresh session."
+  (or
+   (let* ((resp-end (opencode-chat--last-response-end end))
+          (sent-end (and (boundp 'opencode-chat--prompt-marker)
+                         (markerp opencode-chat--prompt-marker)
+                         (marker-position opencode-chat--prompt-marker)))
+          (beg (cond
+                ((and resp-end sent-end) (max resp-end sent-end))
+                (resp-end resp-end)
+                (sent-end sent-end)
+                (t nil))))
+     (when (and beg (<= beg end)) beg))
+   (let ((body (opencode-chat--body-beg)))
+     (when (<= body end) body))
+   (point-min)))
+
+(defun opencode-chat--normalize-prompt (text)
+  "Collapse TEXT to a single stdin line for `ocd --stream'.
+Newlines would otherwise each become a separate OpenCode turn."
+  (string-trim
+   (replace-regexp-in-string "[ \t\n\r]+" " " text)))
+
+(defun opencode-chat--remove-local-variables-section ()
+  "Delete every `Local Variables' / `End:' block in the buffer.
+Used before rewriting a single trailing block so legacy header
+copies do not survive beside the canonical footer."
+  (save-excursion
+    (goto-char (point-min))
+    (while (re-search-forward "^;; Local Variables:\\s-*$" nil t)
+      (let ((beg (match-beginning 0)))
+        (if (re-search-forward "^;; End:\\s-*$" nil t)
+            (progn
+              (forward-line 1)
+              (delete-region beg (point)))
+          (goto-char (point-max)))))))
+
 ;;;###autoload
 (defun opencode-chat-send ()
   "Send the current prompt to the OpenCode subprocess.
-With a prefix argument, send the active region instead of the
-text from the last response boundary to point."
+With a prefix argument, send the active region.
+
+Without a prefix, send the text after the last assistant response
+through the end of the chat body (not merely through point).  This
+matters in Evil normal state, where point often rests on the last
+response character while the follow-up was typed at EOB.
+
+The prompt is normalized to a single line: `ocd --stream' reads
+stdin line-by-line, so embedded newlines would enqueue extra turns."
   (interactive)
   (unless (and (boundp 'opencode-chat--process)
                opencode-chat--process)
@@ -86,20 +240,23 @@ text from the last response boundary to point."
     (user-error "opencode-chat-send: subprocess has exited"))
   (let* ((prefix current-prefix-arg)
          (use-region (and prefix (use-region-p)))
+         (end (if use-region (region-end) (opencode-chat--body-end)))
          (beg (if use-region
                   (region-beginning)
-                (save-excursion
-                  (or (previous-single-property-change (point) 'opencode-response)
-                      (point-min)))))
-         (end (if use-region
-                  (region-end)
-                (point)))
-         (prompt (string-trim (buffer-substring-no-properties beg end))))
+                (opencode-chat--prompt-beg end)))
+         (prompt (opencode-chat--normalize-prompt
+                  (if (< beg end)
+                      (buffer-substring-no-properties beg end)
+                    ""))))
     (when (string-empty-p prompt)
       (user-error "opencode-chat-send: nothing to send"))
     (process-send-string opencode-chat--process (concat prompt "\n"))
-    (goto-char (point-max))
-    (insert "\n")
+    (opencode-chat--goto-body-end)
+    (unless (eq (char-before) ?\n)
+      (insert "\n"))
+    (if (markerp opencode-chat--prompt-marker)
+        (set-marker opencode-chat--prompt-marker (point))
+      (setq opencode-chat--prompt-marker (point-marker)))
     (setq opencode-chat--sending t)))
 
 ;;;###autoload
@@ -328,7 +485,9 @@ so `opencode-chat-mode' saves and restores this value around it.")
 (make-variable-buffer-local 'opencode-chat--session-id)
 
 (defvar opencode-chat--bounds nil
-  "Alist of (BEGIN . END) response region bounds for persistence.")
+  "Alist of (BEGIN . END) response region bounds for persistence.
+Live prompt detection uses the `opencode-response' text-property;
+this alist is a snapshot rewritten from those properties on save.")
 (make-variable-buffer-local 'opencode-chat--bounds)
 
 (defvar opencode-chat--created nil
@@ -342,6 +501,13 @@ when the response stream completes.  Currently used as a hook for
 visual feedback (e.g. mode-line indicators); future todos may add
 automatic clearing.")
 (make-variable-buffer-local 'opencode-chat--sending)
+
+(defvar opencode-chat--prompt-marker nil
+  "Marker at the end of the last sent prompt.
+`opencode-chat-send' advances this so the same text is not resent
+before the next assistant region is recorded in
+`opencode-chat--bounds'.")
+(make-variable-buffer-local 'opencode-chat--prompt-marker)
 
 ;;; Mode and keymap.
 
@@ -433,6 +599,7 @@ before our setup completes."
     (setq opencode-chat--bounds (or saved-bounds nil))
     (setq opencode-chat--created (or saved-created nil))
     (setq opencode-chat--sending nil)
+    (setq opencode-chat--prompt-marker nil)
     ;; For file-backed buffers without a session name (e.g. a raw
     ;; `find-file' + `opencode-chat-mode' without going through
     ;; `opencode-chat-open'), derive the session name from the file
@@ -491,14 +658,18 @@ the call (see `opencode-chat-mode')."
                           expanded
                         opencode-chat-ocd-program))
          (stderr-buf (get-buffer-create "*opencode-chat-stderr*"))
+         (command (append (list ocd-program
+                                "--stream"
+                                "--jsonl"
+                                "--name"
+                                opencode-chat--session-name)
+                          (when opencode-chat-auto-approve
+                            (list "--auto"))))
          (process (make-process
                    :name "opencode-chat"
                    :buffer (current-buffer)
                    :coding '(utf-8 . no-conversion)
-                   :command (list ocd-program
-                                  "--stream"
-                                  "--name"
-                                  opencode-chat--session-name)
+                   :command command
                    :stderr stderr-buf
                    :connection-type 'pipe
                    :noquery t)))
@@ -511,8 +682,11 @@ the call (see `opencode-chat-mode')."
   "Process filter for the `opencode-chat' subprocess.
 Parses JSON Lines from OUTPUT (one JSON object per line), accumulates
 partial lines in the buffer-local `opencode-chat--pending-output',
-and inserts text chunks into the current buffer with the
+and inserts text chunks into the process buffer with the
 `opencode-response' text-property.
+
+Always switches to `(process-buffer PROC)' — filters are not
+guaranteed to run with that buffer current.
 
 Each line is one of:
 - `{\"type\":\"text\",\"text\":\"...\"}' -- text chunk of the assistant's
@@ -521,26 +695,30 @@ Each line is one of:
   session ID; stored in `opencode-chat--session-id'.
 - Other types (reasoning, tool calls, etc.) -- logged to
   `*opencode-chat-stderr*' and skipped (todo 10+ handles tool rendering)."
-  (let ((stderr-buf (get-buffer-create "*opencode-chat-stderr*"))
-        (combined (concat opencode-chat--pending-output output)))
-    ;; Find the position of the last newline in the combined string.
-    ;; Everything before it is complete lines; everything after is
-    ;; partial (kept for the next filter call).
-    (let ((last-newline (string-match "\n[^\n]*\\'" combined)))
-      (if (null last-newline)
-          ;; No newline at all: the entire combined string is partial.
-          (setq opencode-chat--pending-output combined)
-        ;; Process complete lines (everything before the last newline).
-        (let* ((complete (substring combined 0 last-newline))
-               (partial (substring combined (1+ last-newline))))
-          (setq opencode-chat--pending-output partial)
-          (dolist (line (split-string complete "\n" t))
-            (opencode-chat--process-line line stderr-buf)))))))
+  (let ((buf (process-buffer proc)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (let ((stderr-buf (get-buffer-create "*opencode-chat-stderr*"))
+              (combined (concat opencode-chat--pending-output output)))
+          ;; Find the position of the last newline in the combined string.
+          ;; Everything before it is complete lines; everything after is
+          ;; partial (kept for the next filter call).
+          (let ((last-newline (string-match "\n[^\n]*\\'" combined)))
+            (if (null last-newline)
+                ;; No newline at all: the entire combined string is partial.
+                (setq opencode-chat--pending-output combined)
+              ;; Process complete lines (everything before the last newline).
+              (let* ((complete (substring combined 0 last-newline))
+                     (partial (substring combined (1+ last-newline))))
+                (setq opencode-chat--pending-output partial)
+                (dolist (line (split-string complete "\n" t))
+                  (opencode-chat--process-line line stderr-buf))))))))))
 
 (defun opencode-chat--process-line (line stderr-buf)
   "Parse one JSON line from ocd --stream and apply it.
 LINE is a complete JSON line (without trailing newline).
-STDERR-BUF is the buffer for logging unknown event types and errors."
+STDERR-BUF is the buffer for logging unknown event types and errors.
+Must be called with the chat buffer current."
   (condition-case err
       (let* ((parsed (json-parse-string line :object-type 'alist))
              (type (alist-get "type" parsed nil nil #'string=)))
@@ -550,8 +728,15 @@ STDERR-BUF is the buffer for logging unknown event types and errors."
              (when (and text (not (string-empty-p text)))
                (opencode-chat--insert-text text))))
           ("session_id"
-           (setq opencode-chat--session-id
-                 (alist-get "id" parsed nil nil #'string=)))
+           (let ((id (alist-get "id" parsed nil nil #'string=)))
+             (setq opencode-chat--session-id id)
+             ;; Persist promptly when a trailing Local Variables block
+             ;; is intact.  Skip if the footer was corrupted — save-state
+             ;; will rewrite it later.
+             (when (and id buffer-file-name
+                        (opencode-chat--local-variables-start))
+               (save-excursion
+                 (add-file-local-variable 'opencode-chat--session-id id)))))
           (_
            (with-current-buffer stderr-buf
              (goto-char (point-max))
@@ -593,60 +778,70 @@ for the same response (each chunk extends the region)."
     (let ((new-end (point)))
       (set-text-properties beg new-end
                            '(opencode-response t
-                             front-sticky (opencode-response)))
+                             front-sticky (opencode-response)
+                             ;; Keep follow-up typing from inheriting
+                             ;; the assistant mark (Evil append / EOB).
+                             rear-nonsticky (opencode-response)))
       ;; Record or extend bounds.  If the new region starts at or
       ;; before the end of the last recorded region, extend the last
       ;; entry.  Otherwise push a new entry.
       (let ((last (car (last opencode-chat--bounds))))
-        (if (and last (<= beg (cdr last)))
+        (if (and (consp last) (numberp (cdr last)) (<= beg (cdr last)))
             ;; Adjacent or overlapping: extend the last entry.
-            (setcdr (last opencode-chat--bounds) new-end)
+            (setcdr last new-end)
           ;; New region: push a new entry.
-          (push (cons beg new-end) opencode-chat--bounds)
-          (setq opencode-chat--bounds (nreverse opencode-chat--bounds)))))))
+          (setq opencode-chat--bounds
+                (append opencode-chat--bounds
+                        (list (cons beg new-end)))))))))
 
 (defun opencode-chat--insert-text (text)
   "Insert TEXT as part of a response with the `opencode-response' property.
 If the buffer is not currently inside a response region, this is the
-first chunk of a new turn: ensure the buffer ends with a newline,
-insert a blank line separator, then insert the text.  Subsequent
-chunks of the same turn are concatenated without separator.
+first chunk of a new turn: move to the chat body end (before Local
+Variables), ensure a blank line separator, then insert the text.
+Subsequent chunks of the same turn are concatenated without separator.
 
-Delegates the actual insertion and bounds recording to
-`opencode-chat--insert-response-chunk' so subprocess responses are
-also tracked in `opencode-chat--bounds' for todo 13's persistence."
-  (let ((start-pos (point))
-        (in-response (and (> (point) (point-min))
-                          (get-text-property (1- (point))
-                                             'opencode-response))))
+Always keeps a newline between the response and the trailing
+`;; Local Variables:' line so the footer is never prefixed."
+  (let* ((lv (opencode-chat--local-variables-start))
+         (in-response (and (> (point) (point-min))
+                           (or (null lv) (< (point) lv))
+                           (get-text-property (max (point-min) (1- (point)))
+                                              'opencode-response)))
+         (start-pos nil))
     (unless in-response
-      ;; First chunk of a new turn.
+      (opencode-chat--goto-body-end)
       (unless (= (point) (point-min))
-        ;; Buffer has content: ensure it ends with a newline, then
-        ;; insert a blank line separator before the new response.
         (unless (eq (char-before) ?\n)
           (insert "\n"))
-        (insert "\n")
-        (setq start-pos (point))))
-    ;; Insert the text at point.  START and END are equal here (we
-    ;; just adjusted START to account for the separator), so the
-    ;; helper inserts without deleting.
-    (opencode-chat--insert-response-chunk start-pos (point) text)))
+        (insert "\n"))
+      (setq start-pos (point)))
+    (when (null start-pos)
+      (setq start-pos (point)))
+    (opencode-chat--insert-response-chunk start-pos (point) text)
+    ;; Keep Local Variables on its own line and leave an empty line for
+    ;; the next user prompt.  Point is mid-line here, so no `^' anchor.
+    (when (looking-at-p ";; Local Variables:")
+      (insert "\n\n")
+      (forward-char -1))))
 
 (defun opencode-chat--process-sentinel (proc event)
   "Process sentinel for the `opencode-chat' subprocess.
 Logs EVENT to the `*opencode-chat-stderr*' buffer and clears the
 buffer-local `opencode-chat--process' when the subprocess finishes
 or exits abnormally.  Does NOT kill the buffer or close Emacs."
-  (let ((stderr-buf (get-buffer-create "*opencode-chat-stderr*")))
+  (let ((stderr-buf (get-buffer-create "*opencode-chat-stderr*"))
+        (buf (process-buffer proc)))
     (with-current-buffer stderr-buf
       (goto-char (point-max))
       (insert (format "[%s] sentinel: %s\n"
                       (format-time-string "%H:%M:%S")
-                      event))))
-  (when (or (string-match-p "finished" event)
-            (string-match-p "exited abnormally" event))
-    (setq opencode-chat--process nil)))
+                      event)))
+    (when (and (buffer-live-p buf)
+               (or (string-match-p "finished" event)
+                   (string-match-p "exited abnormally" event)))
+      (with-current-buffer buf
+        (setq opencode-chat--process nil)))))
 
 ;;; State persistence (todo 13).
 ;; File-local vars let `opencode-chat-mode' recover session state when
@@ -661,6 +856,11 @@ Installed on `write-file-functions' by `opencode-chat-mode'.  Uses
 buffer's `Local Variables:' section, so the next `find-file' can
 restore the session via `opencode-chat--restore-state'.
 
+`opencode-chat--bounds' is recomputed from live `opencode-response'
+text properties (not the possibly stale in-memory alist) so edits
+earlier in the buffer do not persist wrong offsets.  Markers keep
+those runs stable while the Local Variables block is rewritten.
+
 The four vars persisted are:
 - `opencode-chat--session-name' (string, always present for session files)
 - `opencode-chat--session-id' (string or nil)
@@ -674,18 +874,23 @@ is the buffer position passed by `write-file-functions' (unused)."
     (let ((session-name opencode-chat--session-name)
           (session-id (and (boundp 'opencode-chat--session-id)
                            opencode-chat--session-id))
-          (bounds (and (boundp 'opencode-chat--bounds)
-                       opencode-chat--bounds))
           (created (and (boundp 'opencode-chat--created)
-                        opencode-chat--created)))
-      ;; `add-file-local-variable' updates existing entries and creates
-      ;; the `Local Variables:' section if missing.  All four vars are
-      ;; marked safe via `put' at the bottom of this file, so no user
-      ;; prompt is triggered.
+                        opencode-chat--created))
+          ;; Capture runs before Local Variables edits shift positions.
+          (runs (opencode-chat--response-run-markers))
+          bounds)
+      ;; Drop legacy header Local Variables (and any stale copy) so the
+      ;; canonical block lives at end-of-file where Emacs can find it.
+      (opencode-chat--remove-local-variables-section)
+      (setq bounds (mapcar (lambda (pair)
+                             (cons (marker-position (car pair))
+                                   (marker-position (cdr pair))))
+                           runs)
+            opencode-chat--bounds bounds)
       (add-file-local-variable 'opencode-chat--session-name session-name)
       (add-file-local-variable 'opencode-chat--session-id session-id)
-      (add-file-local-variable 'opencode-chat--bounds bounds)
-      (add-file-local-variable 'opencode-chat--created created)))
+      (add-file-local-variable 'opencode-chat--created created)
+      (add-file-local-variable 'opencode-chat--bounds bounds)))
   ;; Return nil so `save-buffer' proceeds with the normal write.
   nil)
 
@@ -708,7 +913,8 @@ with non-numeric or inverted bounds are skipped silently."
           (when (< beg end)
             (set-text-properties beg end
                                  '(opencode-response t
-                                   front-sticky (opencode-response)))))))))
+                                   front-sticky (opencode-response)
+                                   rear-nonsticky (opencode-response)))))))))
 
 (defun opencode-chat--restore-state ()
   "Restore session state from file-local vars.
@@ -875,21 +1081,22 @@ in practice)."
 
 (defun opencode-chat--create-session-file (file name)
   "Write FILE with initial content and file-local vars for session NAME.
-The file-local vars (`opencode-chat--session-name',
-`opencode-chat--session-id', `opencode-chat--bounds',
-`opencode-chat--created') let `opencode-chat-mode' recover the
-session on future `find-file' invocations (todo 13's restore flow).
+Chat body comes first; the `Local Variables' block is at end-of-file
+so Emacs still finds it after the transcript grows past 3kB.
 The `safe-local-variable' declarations at the bottom of this file
-mark them as safe so Emacs does not prompt the user."
+mark the vars as safe so Emacs does not prompt the user."
   (let ((created (format-time-string "%Y-%m-%dT%H:%M:%S%z")))
     (with-temp-buffer
       (insert (format "# OpenCode Chat Session: %s\n\n" name))
-      (insert "Type your message and press `C-c C-c` to send.\n\n")
+      (insert "Type your message and press `C-c C-c` to send.\n")
+      ;; Blank line = empty editable body. Trailing Local Variables must
+      ;; stay at EOB for `hack-local-variables' on long transcripts.
+      (insert "\n")
       (insert ";; Local Variables:\n")
-      (insert (format ";; opencode-chat--session-name: %s\n" name))
+      (insert (format ";; opencode-chat--session-name: %S\n" name))
       (insert ";; opencode-chat--session-id: nil\n")
       (insert ";; opencode-chat--bounds: nil\n")
-      (insert (format ";; opencode-chat--created: %s\n" created))
+      (insert (format ";; opencode-chat--created: %S\n" created))
       (insert ";; End:\n")
       (write-region (point-min) (point-max) file nil 'no-message))))
 
@@ -949,6 +1156,9 @@ new files are created with file-local vars for future restoration."
           (opencode-chat-mode))
       (error
        (message "opencode-chat: mode activation failed: %S" err)))
+    ;; Place point in the editable body (before the trailing Local
+    ;; Variables block), ready for the first prompt.
+    (goto-char (opencode-chat--body-beg))
     (current-buffer)))
 
 ;; Declare file-local vars as safe so Emacs does not prompt the user
