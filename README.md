@@ -7,31 +7,130 @@ CLI wrapper around the [OpenCode](https://github.com/sst/opencode) Agent SDK, pl
 
 ## Requirements
 
-- [Bun](https://bun.sh) (build / run from source)
-- A running OpenCode server (auto-started on `127.0.0.1:4097` when needed), or set `OCD_SERVER_URL`
-- Emacs 27.1+ for the chat package
+| Tool | Why |
+|------|-----|
+| [Bun](https://bun.sh) | Run / build `ocd` |
+| [OpenCode](https://github.com/sst/opencode) CLI (`opencode` on `PATH`) | Daemon `opencode serve --pure` on `:4097` (auto-started by `ocd`) |
+| Emacs 27.1+ / [Spacemacs](https://www.spacemacs.org/) | Optional front-end (`opencode-chat.el`) |
 
-## Install
+Configure OpenCode providers/auth the usual way (`opencode` itself) before expecting answers from models.
+
+## Setup on a new machine
+
+### 1. Install prerequisites
 
 ```bash
+# Bun — https://bun.sh
+curl -fsSL https://bun.sh/install | bash
+
+# OpenCode CLI — follow upstream install docs, then:
+opencode --version
+# log in / configure providers as required by your OpenCode setup
+```
+
+Ensure `bun` and `opencode` are on your `PATH` in both shells and GUI Emacs (macOS GUI apps often miss `~/bin` — set `exec-path` / `PATH` in Emacs if needed).
+
+### 2. Clone and install dependencies
+
+```bash
+git clone <THIS_REPO_URL> ~/src/ocd   # or any path you prefer
+cd ~/src/ocd
 bun install
-bun run build          # → dist/ocd for this platform
-./install.sh           # copies binary to ~/.local/bin/ocd
 ```
 
-Or run from source (recommended if `bun --compile` misbehaves with the SDK):
+### 3. Install the `ocd` command
+
+**Option A — wrapper (recommended).** Avoids `bun --compile` dropping SDK methods:
 
 ```bash
-# wrapper, e.g. ~/bin/ocd
-#!/bin/bash
-exec /path/to/bun run /path/to/this/repo/src/ocd.ts "$@"
+mkdir -p ~/bin
+cat > ~/bin/ocd <<'EOF'
+#!/usr/bin/env bash
+# Point REPO at your clone:
+REPO="${OCD_REPO:-$HOME/src/ocd}"
+exec bun run "$REPO/src/ocd.ts" "$@"
+EOF
+chmod +x ~/bin/ocd
 ```
 
-Cross-platform binaries:
+Add `~/bin` to `PATH` (e.g. in `~/.zshrc`: `export PATH="$HOME/bin:$PATH"`).
+
+**Option B — compiled binary:**
 
 ```bash
-bun run build:all      # darwin/linux × arm64/x64 under dist/
+bun run build          # → dist/ocd
+./install.sh           # → ~/.local/bin/ocd
+# ensure ~/.local/bin is on PATH
 ```
+
+Cross-platform set: `bun run build:all` then `./install.sh` picks the matching `dist/ocd-*`.
+
+### 4. Smoke-test the CLI
+
+```bash
+ocd --help
+ocd "what is 2+2?"                 # starts daemon on :4097 if needed
+echo quit | ocd --stream --name smoke
+```
+
+Named CLI sessions are stored under `~/.ocd/`. Override the server with `OCD_SERVER_URL` if you already run OpenCode elsewhere.
+
+### 5. Emacs / Spacemacs (`opencode-chat`)
+
+#### Plain Emacs
+
+```elisp
+(add-to-list 'load-path "~/src/ocd")   ; directory that contains opencode-chat.el
+(require 'opencode-chat)
+(setq opencode-chat-ocd-program (expand-file-name "~/bin/ocd"))
+;; optional:
+;; (setq opencode-chat-auto-approve t)
+```
+
+#### Spacemacs
+
+1. Symlink the package into the private local tree (survives layer reloads):
+
+```bash
+mkdir -p ~/.emacs.d/private/local/opencode-chat
+ln -sf ~/src/ocd/opencode-chat.el \
+  ~/.emacs.d/private/local/opencode-chat/opencode-chat.el
+```
+
+2. In `.spacemacs`, inside `dotspacemacs/user-config`:
+
+```elisp
+(defun dotspacemacs/user-config ()
+  ;; …your other config…
+
+  (add-to-list 'load-path
+               (expand-file-name "~/.emacs.d/private/local/opencode-chat"))
+  (require 'opencode-chat)
+  (setq opencode-chat-ocd-program (expand-file-name "~/bin/ocd"))
+  ;; (setq opencode-chat-auto-approve t)
+
+  ;; Optional Spacemacs leader bindings (SPC o c …)
+  (spacemacs/declare-prefix "o c" "opencode-chat")
+  (spacemacs/set-leader-keys
+    "o c o" #'opencode-chat-open
+    "o c s" #'opencode-chat-send
+    "o c k" #'opencode-chat-abort
+    "o c r" #'opencode-chat-rename-session
+    "o c l" #'opencode-chat-list-sessions
+    "o c u" #'opencode-chat-resume
+    "o c q" #'opencode-chat-kill-session))
+```
+
+3. Restart Emacs / Spacemacs (`SPC q r`) or `M-x load-file` the package, then:
+
+- `M-x opencode-chat-open` (or `SPC o c o`) — new chat buffer  
+- type a prompt, `C-c C-c` (or `SPC o c s`) to send  
+
+Chat files live in `~/.opencode-chat/sessions/<name>.md`. Emacs talks to `ocd` as:
+
+`ocd --stream --jsonl --name <session> [--auto]`
+
+If the buffer says there is no subprocess, `opencode-chat-ocd-program` is wrong or not executable — check with `M-: (executable-find opencode-chat-ocd-program)`.
 
 ## CLI usage
 
@@ -65,17 +164,9 @@ Exit the loop with `quit`, stdin EOF, or idle SIGINT. Mid-stream SIGINT aborts t
 | `--jsonl` | Emit `{"type":"session_id"\|"text",...}` lines |
 | `--auto` | Auto-approve OpenCode permissions |
 
-## Emacs (`opencode-chat.el`)
+## Emacs reference (`opencode-chat.el`)
 
-1. Put `opencode-chat.el` on `load-path` (or symlink into `~/.emacs.d/private/local/opencode-chat/`).
-2. Point `opencode-chat-ocd-program` at your `ocd` wrapper.
-3. Optionally enable auto-approve: `(setq opencode-chat-auto-approve t)`.
-
-```elisp
-(add-to-list 'load-path "~/path/to/repo") ; or private/local/opencode-chat/
-(require 'opencode-chat)
-(setq opencode-chat-ocd-program (expand-file-name "~/bin/ocd"))
-```
+Install steps: [Setup on a new machine](#setup-on-a-new-machine). In-buffer keys:
 
 | Command | Binding | Action |
 |---------|---------|--------|
