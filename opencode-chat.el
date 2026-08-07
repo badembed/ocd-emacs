@@ -272,6 +272,35 @@ When no subprocess is running, just kills the buffer (with the
     (let ((kill-buffer-query-functions nil))
       (kill-buffer (current-buffer)))))
 
+;;;###autoload
+(defun opencode-chat-resume ()
+  "Resume an existing OpenCode chat session.
+Lists session files in `opencode-chat-sessions-dir' and prompts with
+`completing-read' for one.  The selected session is opened via
+`find-file'; `opencode-chat-mode' auto-activates via `auto-mode-alist'
+and triggers `opencode-chat--restore-state' from todo 13, which
+resumes the subprocess and restores response-region text properties.
+
+Available via `M-x opencode-chat-resume' (no default keybinding).
+
+Returns the buffer that was opened, or nil when no sessions exist."
+  (interactive)
+  (let* ((sessions (opencode-chat--list-session-files))
+         (choice (and sessions
+                      (completing-read
+                       "Resume session: "
+                       sessions nil t nil nil
+                       (car sessions))))
+         (file (and choice
+                    (opencode-chat--session-file choice))))
+    (cond
+     ((null sessions)
+      (message "no sessions found")
+      nil)
+     (choice
+      (find-file file)
+      (current-buffer)))))
+
 ;;; Internal variables (buffer-local state).
 ;; These are declared with `defvar' (not just `setq-local') so that
 ;; `let' bindings in callers create dynamic bindings visible inside
