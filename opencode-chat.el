@@ -119,16 +119,158 @@ text from the last response boundary to point."
 ;;;###autoload
 (defun opencode-chat-rename-session (new-name)
   "Rename the current session to NEW-NAME.
-Moves the backing file and restarts the subprocess with the new
-name.  Signals an error if NEW-NAME already exists."
-  (interactive "sNew session name: ")
-  (user-error "opencode-chat-rename-session: not yet implemented"))
+Prompt interactively with completion against existing session files
+(basename without the `.md' extension).  When called non-interactively
+with a string NEW-NAME, use it directly.
+
+If NEW-NAME equals the current session name, signal no-op with a
+\"same name\" message.  If NEW-NAME already exists as a session file,
+signal a user-error.  If a subprocess is mid-stream (the buffer-local
+`opencode-chat--sending' flag is non-nil), abort it via
+`opencode-chat-abort' and wait for the process to exit before
+proceeding.
+
+On success: `rename-file' the backing file, update the buffer-local
+`opencode-chat--session-name', update the file-local var via
+`add-file-local-variable', save the buffer, and restart the subprocess
+with the new name via `opencode-chat--start-process'.  Returns NEW-NAME."
+  (interactive
+   (list (completing-read "New session name: "
+                          #'opencode-chat--list-session-files
+                          nil nil nil nil
+                          (or (and (boundp 'opencode-chat--session-name)
+                                   opencode-chat--session-name)
+                              ""))))
+  (let* ((current-name (and (boundp 'opencode-chat--session-name)
+                            opencode-chat--session-name))
+         (sanitized (opencode-chat--sanitize-name new-name))
+         (old-file (and buffer-file-name buffer-file-name))
+         (new-file (and sanitized (not (string-empty-p sanitized))
+                        (opencode-chat--session-file-path sanitized)))
+         (same-name (and current-name sanitized
+                         (string= sanitized current-name))))
+    ;; Empty input: nothing to do.
+    (unless (and sanitized (not (string-empty-p sanitized)))
+      (user-error "opencode-chat-rename-session: new name is empty"))
+    (unless old-file
+      (user-error "opencode-chat-rename-session: buffer is not file-backed"))
+    ;; No-op when the new name matches the current name.  Return
+    ;; early so we don't trip the "session already exists" check
+    ;; below (the new path equals the old path in this case).
+    (if same-name
+        (progn
+          (message "opencode-chat: same name")
+          sanitized)
+      ;; Refuse to overwrite an existing session file.
+      (when (and new-file (file-exists-p new-file))
+        (user-error "opencode-chat-rename-session: session already exists: %s"
+                    sanitized))
+      ;; If a stream is in flight, abort it and wait for the process
+      ;; to exit so the rename is safe (the subprocess holds the
+      ;; session name; renaming mid-stream would leave it talking to
+      ;; a stale session name).
+      (when (and (boundp 'opencode-chat--sending)
+                 opencode-chat--sending
+                 (boundp 'opencode-chat--process)
+                 opencode-chat--process
+                 (process-live-p opencode-chat--process))
+        (opencode-chat-abort)
+        (opencode-chat--wait-for-process-exit opencode-chat--process 5.0))
+      ;; Move the file on disk and update the buffer's file
+      ;; association.
+      (condition-case err
+          (progn
+            (rename-file old-file new-file 1)
+            (set-visited-file-name new-file))
+        (error
+         (user-error "opencode-chat-rename-session: rename failed: %S" err)))
+      ;; Update the buffer-local and file-local session name, then
+      ;; save so the new file-local var is persisted to disk.
+      (setq opencode-chat--session-name sanitized)
+      (add-file-local-variable 'opencode-chat--session-name sanitized)
+      (condition-case err
+          (save-buffer)
+        (error
+         (message "opencode-chat: save-buffer after rename failed: %S" err)))
+      ;; Restart the subprocess with the new name.  If a process is
+      ;; still hanging around (e.g. the abort timeout fired), kill
+      ;; it first so `--start-process' can spawn a fresh one.
+      (when (and (boundp 'opencode-chat--process)
+                 opencode-chat--process
+                 (process-live-p opencode-chat--process))
+        (delete-process opencode-chat--process)
+        (setq opencode-chat--process nil))
+      (condition-case err
+          (opencode-chat--start-process)
+        (error
+         (message "opencode-chat: failed to start subprocess after rename: %S"
+                  err)))
+      sanitized)))
 
 ;;;###autoload
 (defun opencode-chat-list-sessions ()
-  "List all OpenCode sessions known to `ocd'."
+  "List all OpenCode sessions known to `ocd'.
+Shells out to `opencode-chat-ocd-program' with `-l' and displays the
+output in the `*opencode-chat-sessions*' buffer, switching to it so
+the user sees the table.
+
+Signals a user-error when `opencode-chat-ocd-program' is not found on
+PATH (so the user gets a clear message instead of a confusing shell
+error)."
   (interactive)
-  (user-error "opencode-chat-list-sessions: not yet implemented"))
+  (unless (or (file-executable-p opencode-chat-ocd-program)
+              (executable-find opencode-chat-ocd-program))
+    (user-error "opencode-chat-list-sessions: %s not found on PATH"
+                opencode-chat-ocd-program))
+  (let ((out-buf (get-buffer-create "*opencode-chat-sessions*")))
+    (with-current-buffer out-buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (condition-case err
+        (let ((exit-code (process-file opencode-chat-ocd-program
+                                       nil out-buf nil "-l")))
+          (when (and (numberp exit-code) (/= exit-code 0))
+            (message "opencode-chat-list-sessions: %s exited with code %s"
+                     opencode-chat-ocd-program exit-code)))
+      (error
+       (with-current-buffer out-buf
+         (let ((inhibit-read-only t))
+           (erase-buffer)
+           (insert (format "opencode-chat-list-sessions: failed to run %s: %S\n"
+                           opencode-chat-ocd-program err))))
+       (display-buffer out-buf)
+       (user-error "opencode-chat-list-sessions: %s" err)))
+    (display-buffer out-buf)))
+
+;;;###autoload
+(defun opencode-chat-kill-session ()
+  "Kill the current OpenCode session.
+Sends `quit\\n' to the subprocess stdin, waits up to 5 seconds for it
+to exit, then kills the buffer.  If the subprocess does not exit in
+time, `delete-process' forces termination before the buffer is killed.
+
+When no subprocess is running, just kills the buffer (with the
+`kill-buffer-query-functions' suppressed so Emacs does not prompt)."
+  (interactive)
+  (let ((proc (and (boundp 'opencode-chat--process)
+                   opencode-chat--process)))
+    (when (and proc (process-live-p proc))
+      (condition-case err
+          (process-send-string proc "quit\n")
+        (error
+         (message "opencode-chat-kill-session: send quit failed: %S" err)))
+      (unless (opencode-chat--wait-for-process-exit proc 5.0)
+        (message "opencode-chat-kill-session: subprocess did not exit in time, deleting")
+        (delete-process proc)))
+    ;; Clear the buffer-local handle so the sentinel (if it fires
+    ;; later) does not see a stale reference.
+    (when (boundp 'opencode-chat--process)
+      (setq opencode-chat--process nil))
+    ;; Kill the buffer without prompting.  `kill-buffer' runs
+    ;; `kill-buffer-query-functions'; bypassing them with
+    ;; `unwind-protect' is not safe, so we temporarily clear them.
+    (let ((kill-buffer-query-functions nil))
+      (kill-buffer (current-buffer)))))
 
 ;;; Internal variables (buffer-local state).
 ;; These are declared with `defvar' (not just `setq-local') so that
@@ -646,6 +788,30 @@ is returned (callers should handle the rare collision)."
   "Return a filesystem-safe version of NAME.
 Replaces any character not in `[a-zA-Z0-9._-]' with `_'."
   (replace-regexp-in-string "[^a-zA-Z0-9._-]" "_" name))
+
+(defun opencode-chat--list-session-files ()
+  "Return sorted session basenames (without `.md') in sessions dir.
+Returns an empty list when the directory is empty or contains no
+`.md' files.  Used by `opencode-chat-rename-session' for completion
+and by `opencode-chat-resume' for session selection."
+  (let ((dir (opencode-chat--ensure-sessions-dir)))
+    (sort (mapcar #'file-name-base
+                  (directory-files dir nil "\\.md\\'"))
+          #'string<)))
+
+(defun opencode-chat--wait-for-process-exit (proc timeout)
+  "Wait up to TIMEOUT seconds for PROC to exit.
+Returns t if the process exited (or was never live) within TIMEOUT,
+nil otherwise.  Uses `accept-process-output' in a loop so pending
+output is drained and the sentinel can fire."
+  (when (and proc (process-live-p proc))
+    (let ((deadline (+ (float-time) timeout))
+          (ok nil))
+      (while (and (process-live-p proc)
+                  (< (float-time) deadline))
+        (accept-process-output proc 0.1))
+      (setq ok (not (process-live-p proc)))
+      ok)))
 
 ;;; Open command (todo 11).
 ;; Reuses `opencode-chat--ensure-sessions-dir' from the Session
