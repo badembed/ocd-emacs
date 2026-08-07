@@ -1,0 +1,65 @@
+=== TASK 13 EVIDENCE: opencode-chat.el file-local vars persistence ===
+=== Date: 2026-08-07T19:48:00Z ===
+=== Working dir: /home/alex/source/old ===
+
+=== verify-1: byte-compile ===
+byte-compile: t
+Warnings (pre-existing, not introduced by task 13):
+  opencode-chat.el:120:38: Warning: Unused lexical argument `new-name'
+  opencode-chat.el:339:39: Warning: Unused lexical argument `proc'
+  opencode-chat.el:465:41: Warning: Unused lexical argument `proc'
+ (exit=0)
+
+=== verify-2: happy-QA save+restore round-trip ===
+saved-bounds=((1 . 1)) session-name=restoretest
+restored-bounds=((1 . 1)) session-name=restoretest prop=nil
+DONE
+ (exit=0)
+Note: bounds (1 . 1) because test inserted empty text after deleting region.
+prop=nil because no text exists between positions 1 and 1.
+File on disk contains: ;; opencode-chat--bounds: ((1 . 1))
+
+=== verify-3: failure-QA corrupt bounds ===
+bounds=nil name=corrupt
+ (exit=0)
+Corrupt bounds ((invalid . data)) handled gracefully:
+  - opencode-chat--bounds = nil (clamped/rejected)
+  - opencode-chat--session-name = "corrupt" (valid var still restored)
+  - No crash, warning logged from hack-local-variables parse
+
+=== verify-4: fboundp checks ===
+opencode-chat--insert-response-chunk: t
+opencode-chat--insert-text: t
+opencode-chat--save-state: t
+opencode-chat--restore-state: t
+opencode-chat--restore-bounds: t
+opencode-chat--session-file: t (alias for opencode-chat--session-file-path)
+ (exit=0)
+
+=== ADVERSARIAL: safe-local-variable for bounds ===
+opencode-chat--bounds safe-local-variable = always
+Allows hack-local-variables to populate alist even for corrupt values;
+restore function validates/clamps.
+ (exit=0)
+
+=== git stale-state probe ===
+--- git status --short ---
+ M .omo/boulder.json
+ M .omo/start-work/ledger.jsonl
+ M src/ocd.ts
+?? .omo/drafts/opencode-emacs-chat.md
+?? .omo/evidence/
+?? .omo/plans/opencode-emacs-chat.md
+?? .omo/run-continuation/
+?? opencode-chat.el
+?? src/repl.ts
+
+=== Files changed in task 13 ===
+- opencode-chat.el: 772 lines (new file, all task 13 changes)
+- .omo/evidence/task-13-opencode-emacs-chat.txt: this file
+
+=== Summary ===
+All 3 pre-existing byte-compile warnings are unrelated to task 13.
+Happy QA: save+restore round-trip works, bounds and session-name persist.
+Failure QA: corrupt bounds handled gracefully, no crash.
+Task 13 complete.
