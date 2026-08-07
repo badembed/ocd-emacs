@@ -15,10 +15,10 @@ Do **not** add: TUI, MCP/tool rendering, multimodal, Windows-specific code, here
 
 | Mode | stdout |
 |------|--------|
-| `ocd --stream` (default) | plain assistant text; TTY permissions on stderr (`y`/`a`/`n`) |
-| `ocd --stream --jsonl` | `session_id` / `text` / `permission` JSON lines |
+| `ocd --stream` (default) | plain assistant text; TTY permissions on stderr (`y`/`a`/`n`) via stdin demux |
+| `ocd --stream --jsonl` | `session_id` / `text` / `permission` / `done` JSON lines |
 
-Emacs always passes `--jsonl`. Chat prompts are **one plain line** each (`quit` / EOF / idle SIGINT end the loop).
+Emacs always passes `--jsonl`. Chat prompts are **one plain line** each (`quit` / EOF / idle SIGINT end the loop). JSONL `done` clears Emacs in-flight state.
 
 ### JSONL permission handshake
 
@@ -39,7 +39,8 @@ Permission mode with `--jsonl` (unless `--auto`): stdin demux stays active durin
 → {"type":"prompt","text":"explain this","attachments":[{"name":"foo.ts","path":"/abs/foo.ts"}]}
 ```
 
-- Path-only attachments (no `content`); `ocd` reads files from disk via `assembleStreamParts`.
+- Path-only file context (no bodies): both one-shot `assembleParts` and stream
+  `assembleStreamParts` emit path stubs so the model uses read/edit tools on disk.
 - Emacs resolves `@buffer` mentions, saves dirty buffers, strips mentions from `text`.
 - Plain one-line prompts remain valid for terminal use.
 
@@ -58,10 +59,12 @@ Permission mode with `--jsonl` (unless `--auto`): stdin demux stays active durin
 4. User state only under `~/.ocd/` and `~/.opencode-chat/` — never commit it.
 5. Do not commit `dist/`, `.omo/`, `*.elc`, `node_modules/`.
 6. Process filters must `with-current-buffer (process-buffer proc)`.
-7. `flushSessionText` must emit only the **latest** assistant message.
+7. `flushSessionText` must only flush an assistant message ID observed this turn
+   (never replay a prior turn when SSE printed nothing).
 8. Persistent daemon on `:4097` must not be killed from `closeSpawnedServer()`.
 9. With `--jsonl`, permission asks use stdout/stdin JSONL — never silent reject.
-10. Stdin demux must keep reading during `streamResponse` so `permission_reply` can arrive.
+10. Stdin demux must keep reading during `streamResponse` so `permission_reply`
+    and interactive TTY answers (`y`/`a`/`n`) can arrive.
 
 ## Known limitations
 

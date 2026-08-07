@@ -1,17 +1,7 @@
-import {
-  existsSync,
-  readFileSync,
-  readSync,
-  openSync,
-  closeSync,
-  statSync,
-} from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import type { TextPartInput } from "@opencode-ai/sdk";
 import clipboardy from "clipboardy";
-
-/** Files larger than this are sent as path + metadata, not full contents. */
-export const INLINE_MAX_BYTES = 4 * 1024;
 
 /** Path-only attachment from Emacs `@buffer` mentions (JSONL `prompt`). */
 export type StreamAttachment = {
@@ -62,7 +52,7 @@ export function resolveWorkspace(path: string | undefined): Workspace {
 /**
  * Build prompt parts in order: clipboard → file (if any) → question.
  * Folders are handled via OpenCode directory, not listed into the prompt.
- * Small files are inlined; large files are referenced by path only.
+ * Files are always path stubs (never inlined) so the model uses read/edit tools.
  */
 export function assembleParts(
   file: string | undefined,
@@ -93,7 +83,7 @@ export function assembleParts(
 
   if (file) {
     const st = statSync(file);
-    parts.push(filePart(file, st.size));
+    parts.push(pathReferencePart(file, st.size));
   }
 
   parts.push({ type: "text", text: question });
@@ -101,9 +91,9 @@ export function assembleParts(
 }
 
 /**
- * Build stream-turn parts: path attachments (via disk `filePart`) then question.
- * Missing paths are skipped with a stderr warning. No attachment `content`
- * field — OpenCode reads/edits files on disk.
+ * Build stream-turn parts: path-reference stubs for attachments, then question.
+ * Never inlines file bodies — steers the model toward read/edit tools instead
+ * of pasting diffs into chat. Missing paths are skipped with a stderr warning.
  */
 export function assembleStreamParts(
   text: string,
@@ -133,7 +123,7 @@ export function assembleStreamParts(
         console.error(`warning: attachment is not a file, skipping: ${path}`);
         continue;
       }
-      parts.push(filePart(path, st.size));
+      parts.push(pathReferencePart(path, st.size, att.name));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`warning: cannot attach ${path} (${msg}), skipping`);
@@ -182,47 +172,23 @@ export function parsePromptTurn(line: string): StreamPromptTurn | undefined {
   return { text: obj.text.trim(), attachments };
 }
 
-function filePart(path: string, size: number): TextPartInput {
-  if (size > INLINE_MAX_BYTES) {
-    assertNotBinary(path, size);
-    console.error(
-      `warning: ${path} is ${formatBytes(size)} (>${formatBytes(INLINE_MAX_BYTES)}), sending path only`,
-    );
-    return {
-      type: "text",
-      text:
-        `--- File: ${path} (${formatBytes(size)}, not inlined) ---\n` +
-        `This file is too large to embed in the prompt. ` +
-        `Read it with your file tools as needed (path: ${path}).`,
-    };
-  }
-
-  const content = readFileSync(path, "utf-8");
-  if (content.includes("\0")) {
-    console.error("cannot read binary file: " + path);
-    throw new Error("cannot read binary file: " + path);
-  }
+/**
+ * Point the model at a disk path without embedding contents.
+ * Used for one-shot `ocd file.ts …` and stream `@buffer` attachments.
+ */
+function pathReferencePart(
+  path: string,
+  size: number,
+  label?: string,
+): TextPartInput {
+  const title = label && label !== path ? `${label} → ${path}` : path;
   return {
     type: "text",
-    text: `--- File: ${path} ---\n${content}`,
+    text:
+      `--- File: ${title} (${formatBytes(size)}, path only) ---\n` +
+      `Do not assume file contents from this message. ` +
+      `Use your file tools to read and edit this path on disk: ${path}`,
   };
-}
-
-/** Peek at the start of a large file to reject binaries without a full read. */
-function assertNotBinary(path: string, size: number): void {
-  const peekLen = Math.min(8192, size);
-  if (peekLen <= 0) return;
-  const fd = openSync(path, "r");
-  try {
-    const buf = Buffer.alloc(peekLen);
-    readSync(fd, buf, 0, peekLen, 0);
-    if (buf.includes(0)) {
-      console.error("cannot read binary file: " + path);
-      throw new Error("cannot read binary file: " + path);
-    }
-  } finally {
-    closeSync(fd);
-  }
 }
 
 function formatBytes(n: number): string {

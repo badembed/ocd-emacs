@@ -27,6 +27,11 @@ export type StreamOptions = {
    * Required when `permissionMode` is `jsonl`.
    */
   waitPermissionReply?: WaitPermissionReply;
+  /**
+   * Shared stdin line reader from the stream-loop demux.
+   * Required for interactive TTY permissions while demux owns stdin.
+   */
+  readStdinLine?: () => Promise<string>;
 };
 
 /** Write assistant text to stdout in plain or JSONL form. */
@@ -39,9 +44,14 @@ function writeStdoutText(text: string, jsonl: boolean): void {
   }
 }
 
-/** Terminate a plain-text response; no-op in JSONL mode (each event is a line). */
+/**
+ * End a stream turn: plain mode writes a trailing newline; JSONL emits
+ * `{"type":"done"}` so Emacs can clear `opencode-chat--sending`.
+ */
 function writeStdoutEnd(jsonl: boolean): void {
-  if (!jsonl) {
+  if (jsonl) {
+    process.stdout.write(JSON.stringify({ type: "done" }) + "\n");
+  } else {
     process.stdout.write("\n");
   }
 }
@@ -61,8 +71,15 @@ export async function streamResponse(
   const permissionMode: PermissionMode =
     options.permissionMode ?? "reject";
   const waitPermissionReply = options.waitPermissionReply;
+  const readStdinLine = options.readStdinLine;
   const controller = new AbortController();
   const { signal } = controller;
+  let emittedEnd = false;
+  const finishStdout = (): void => {
+    if (emittedEnd) return;
+    emittedEnd = true;
+    writeStdoutEnd(jsonl);
+  };
 
   setActiveAbort(() => {
     if (!signal.aborted) controller.abort();
@@ -103,6 +120,8 @@ export async function streamResponse(
         console.error(
           `warning: promptAsync unavailable (${msg}), using batch mode`,
         );
+        // Tear down the unused SSE subscription before batch fallback.
+        if (!signal.aborted) controller.abort();
         await batchPrompt(client, sessionID, parts, jsonl);
         return;
       }
@@ -112,6 +131,8 @@ export async function streamResponse(
     const seenText = new Map<string, string>();
     const seenReasoning = new Map<string, string>();
     const roles = new Map<string, "user" | "assistant">();
+    /** Assistant message IDs observed via SSE for this turn only. */
+    const assistantIdsThisTurn: string[] = [];
     /** Part IDs known to be assistant answer text (not reasoning/tool). */
     const textPartIDs = new Set<string>();
     /** Part IDs known to be reasoning (stderr when verbose). */
@@ -215,6 +236,7 @@ export async function streamResponse(
                   signal,
                   answered: answeredPermissions,
                   waitPermissionReply,
+                  readStdinLine,
                 });
               } finally {
                 if (!signal.aborted) armTimeout();
@@ -230,6 +252,12 @@ export async function streamResponse(
             if (info.sessionID !== sessionID) break;
             if (info.role === "user" || info.role === "assistant") {
               roles.set(info.id, info.role);
+            }
+            if (
+              info.role === "assistant" &&
+              !assistantIdsThisTurn.includes(info.id)
+            ) {
+              assistantIdsThisTurn.push(info.id);
             }
             break;
           }
@@ -360,12 +388,13 @@ export async function streamResponse(
         process.stderr.write("\n");
         reasoningOpen = false;
       }
-      // Role/text events can race; if SSE printed nothing, pull final assistant text.
+      // Role/text events can race; if SSE printed nothing, pull this turn's text.
       if (!sawAssistantText) {
-        await flushSessionText(client, sessionID, jsonl);
-      } else {
-        writeStdoutEnd(jsonl);
+        const flushId =
+          assistantIdsThisTurn[assistantIdsThisTurn.length - 1];
+        await flushSessionText(client, sessionID, jsonl, flushId);
       }
+      finishStdout();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("timed out")) {
@@ -374,16 +403,18 @@ export async function streamResponse(
           .abort({ path: { id: sessionID } })
           .catch(() => {});
         if (!sawAssistantText) {
-          await flushSessionText(client, sessionID, jsonl);
-        } else {
-          writeStdoutEnd(jsonl);
+          const flushId =
+            assistantIdsThisTurn[assistantIdsThisTurn.length - 1];
+          await flushSessionText(client, sessionID, jsonl, flushId);
         }
+        finishStdout();
         throw new Error(
           `${msg}\n` +
             `OpenCode stayed busy (title/model call often hangs). ` +
             `Retry, or point OCD_SERVER_URL at a running \`opencode serve\`.`,
         );
       }
+      finishStdout();
       if (msg.startsWith("OpenCode session error:")) {
         throw err instanceof Error ? err : new Error(msg);
       }
@@ -391,6 +422,7 @@ export async function streamResponse(
     } finally {
       if (timer) clearTimeout(timer);
       if (!signal.aborted) controller.abort();
+      finishStdout();
     }
   } finally {
     clearActiveAbort();
@@ -485,27 +517,30 @@ function formatToolError(
   return `[tool:${tool}] error ${ms}ms\n  ${truncateLog(state.error)}\n`;
 }
 
-/** Best-effort dump of the latest assistant text if SSE ended early / timed out.
- * Only the most recent assistant message is written — dumping the full
- * multi-turn history would replay prior answers into `--stream` clients.
+/**
+ * Best-effort dump of assistant text for one message if SSE ended early.
+ * Requires `messageID` from this turn — never flushes a prior turn's answer.
  */
 async function flushSessionText(
   client: OpencodeClient,
   sessionID: string,
   jsonl = false,
+  messageID?: string,
 ): Promise<void> {
+  if (!messageID) return;
   try {
     const msgs = await client.session.messages({ path: { id: sessionID } });
     if (msgs.error || !msgs.data) return;
     for (let i = msgs.data.length - 1; i >= 0; i--) {
       const msg = msgs.data[i];
-      if (msg.info.role !== "assistant") continue;
+      if (msg.info.role !== "assistant" || msg.info.id !== messageID) {
+        continue;
+      }
       for (const part of msg.parts) {
         if (part.type === "text" && part.text) {
           writeStdoutText(part.text, jsonl);
         }
       }
-      writeStdoutEnd(jsonl);
       return;
     }
   } catch {

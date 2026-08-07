@@ -184,39 +184,80 @@ export async function replyPermission(
   }
 }
 
+/** Parse one interactive permission answer line. */
+export function parsePermissionAnswer(
+  line: string,
+): PermissionResponse | "retry" {
+  const key = line.trim().toLowerCase();
+  if (key === "" || key === "y" || key === "yes") return "once";
+  if (key === "a" || key === "always") return "always";
+  if (key === "n" || key === "no" || key === "reject") return "reject";
+  return "retry";
+}
+
+function writePermissionPrompt(perm: PermissionInfo, retry: boolean): void {
+  const pattern =
+    perm.pattern === undefined
+      ? ""
+      : Array.isArray(perm.pattern)
+        ? perm.pattern.join(", ")
+        : perm.pattern;
+  process.stderr.write(
+    `[permission] ${perm.type}\n` +
+      `  ${perm.title}\n` +
+      (pattern ? `  pattern: ${pattern}\n` : "") +
+      (retry ? `  invalid input, try again\n` : "") +
+      `  [y] once  [a] always  [n] reject\n` +
+      `> `,
+  );
+}
+
 /**
- * Ask the user on stderr; read one line from stdin.
- * y/Enter → once, a → always, n → reject. One retry on unknown, then reject.
+ * Ask on stderr; read answers via `readLine` (stream demux) or a private
+ * readline (one-shot). y/Enter → once, a → always, n → reject.
  */
-export function promptPermission(
+export async function promptPermission(
   perm: PermissionInfo,
   signal?: AbortSignal,
+  readLine?: () => Promise<string>,
 ): Promise<PermissionResponse> {
+  if (signal?.aborted) {
+    throw new Error("aborted");
+  }
+
+  if (readLine) {
+    writePermissionPrompt(perm, false);
+    let attempts = 0;
+    while (true) {
+      if (signal?.aborted) throw new Error("aborted");
+      let line: string;
+      try {
+        line = await readLine();
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg === "aborted" || signal?.aborted) {
+          throw err instanceof Error ? err : new Error(msg);
+        }
+        throw err instanceof Error ? err : new Error(msg);
+      }
+      const parsed = parsePermissionAnswer(line);
+      if (parsed !== "retry") return parsed;
+      attempts += 1;
+      if (attempts >= 2) {
+        process.stderr.write("  giving up, rejecting\n");
+        return "reject";
+      }
+      writePermissionPrompt(perm, true);
+    }
+  }
+
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new Error("aborted"));
       return;
     }
 
-    const pattern =
-      perm.pattern === undefined
-        ? ""
-        : Array.isArray(perm.pattern)
-          ? perm.pattern.join(", ")
-          : perm.pattern;
-
-    const writePrompt = (retry: boolean): void => {
-      process.stderr.write(
-        `[permission] ${perm.type}\n` +
-          `  ${perm.title}\n` +
-          (pattern ? `  pattern: ${pattern}\n` : "") +
-          (retry ? `  invalid input, try again\n` : "") +
-          `  [y] once  [a] always  [n] reject\n` +
-          `> `,
-      );
-    };
-
-    writePrompt(false);
+    writePermissionPrompt(perm, false);
 
     const rl = createInterface({
       input: process.stdin,
@@ -249,17 +290,9 @@ export function promptPermission(
     signal?.addEventListener("abort", onAbort, { once: true });
 
     rl.on("line", (line) => {
-      const key = line.trim().toLowerCase();
-      if (key === "" || key === "y" || key === "yes") {
-        finish("once");
-        return;
-      }
-      if (key === "a" || key === "always") {
-        finish("always");
-        return;
-      }
-      if (key === "n" || key === "no" || key === "reject") {
-        finish("reject");
+      const parsed = parsePermissionAnswer(line);
+      if (parsed !== "retry") {
+        finish(parsed);
         return;
       }
       attempts += 1;
@@ -268,7 +301,7 @@ export function promptPermission(
         finish("reject");
         return;
       }
-      writePrompt(true);
+      writePermissionPrompt(perm, true);
     });
 
     rl.on("close", () => {
@@ -293,6 +326,8 @@ export async function handlePermission(opts: {
   signal?: AbortSignal;
   answered: Set<string>;
   waitPermissionReply?: WaitPermissionReply;
+  /** Shared stdin line reader (stream demux) for interactive TTY mode. */
+  readStdinLine?: () => Promise<string>;
 }): Promise<void> {
   const { client, sessionID, perm, mode, signal, answered } = opts;
 
@@ -341,7 +376,7 @@ export async function handlePermission(opts: {
     }
   } else {
     try {
-      response = await promptPermission(perm, signal);
+      response = await promptPermission(perm, signal, opts.readStdinLine);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg === "aborted" || signal?.aborted) {

@@ -111,6 +111,56 @@ export async function runStreamLoop(
 
   const promptQueue = new PromptQueue();
   const pendingPermissionReplies = new Map<string, PermissionWaiter>();
+  type StdinLineWaiter = {
+    resolve: (line: string) => void;
+    reject: (err: Error) => void;
+  };
+  let pendingStdinLine: StdinLineWaiter | null = null;
+
+  /**
+   * Interactive TTY permissions share the demux reader — never open a
+   * second readline on stdin while this loop owns it.
+   */
+  const readStdinLine = (): Promise<string> => {
+    return new Promise<string>((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new Error("aborted"));
+        return;
+      }
+      if (pendingStdinLine) {
+        reject(new Error("duplicate stdin line wait"));
+        return;
+      }
+      let waiter: StdinLineWaiter;
+      const onAbort = (): void => {
+        if (pendingStdinLine !== waiter) return;
+        pendingStdinLine = null;
+        signal.removeEventListener("abort", onAbort);
+        reject(new Error("aborted"));
+      };
+      waiter = {
+        resolve: (line) => {
+          pendingStdinLine = null;
+          signal.removeEventListener("abort", onAbort);
+          resolve(line);
+        },
+        reject: (err) => {
+          pendingStdinLine = null;
+          signal.removeEventListener("abort", onAbort);
+          reject(err);
+        },
+      };
+      pendingStdinLine = waiter;
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+
+  const rejectPendingStdinLine = (reason: string): void => {
+    if (!pendingStdinLine) return;
+    const waiter = pendingStdinLine;
+    pendingStdinLine = null;
+    waiter.reject(new Error(reason));
+  };
 
   const waitPermissionReply: WaitPermissionReply = (id, replySignal) => {
     return new Promise<PermissionResponse>((resolve, reject) => {
@@ -206,12 +256,14 @@ export async function runStreamLoop(
       );
       userInitiatedAbort = true;
       rejectAllPermissionWaiters("aborted");
+      rejectPendingStdinLine("aborted");
       abortActiveSession();
       return;
     }
     console.error(`stream loop: ${source} received, exiting`);
     shuttingDown = true;
     rejectAllPermissionWaiters("aborted");
+    rejectPendingStdinLine("aborted");
     promptQueue.close();
     rl.close();
   };
@@ -222,10 +274,18 @@ export async function runStreamLoop(
   process.on("SIGINT", onSigint);
   signal.addEventListener("abort", onAbort);
 
-  // Always-on stdin demux: permission replies resolve waiters; prompt JSON /
-  // plain text become chat turns (queued even while a stream is in flight).
+  // Always-on stdin demux: permission replies / interactive answers resolve
+  // waiters; JSONL prompt + plain text become chat turns (queued even while
+  // a stream is in flight).
   rl.on("line", (raw) => {
     const line = raw.trim();
+
+    // Interactive permission answers take priority (empty line = once).
+    if (pendingStdinLine) {
+      pendingStdinLine.resolve(line);
+      return;
+    }
+
     if (line.length === 0) return;
 
     const reply = parsePermissionReply(line);
@@ -241,7 +301,8 @@ export async function runStreamLoop(
       return;
     }
 
-    const promptTurn = parsePromptTurn(line);
+    // Structured `prompt` JSON is only for --jsonl clients (Emacs).
+    const promptTurn = jsonl ? parsePromptTurn(line) : undefined;
     if (promptTurn) {
       promptQueue.push(promptTurn);
       return;
@@ -252,9 +313,17 @@ export async function runStreamLoop(
       try {
         const obj = JSON.parse(line) as { type?: unknown };
         if (typeof obj.type === "string") {
-          process.stderr.write(
-            `warning: ignoring unknown control JSON type ${obj.type}\n`,
-          );
+          if (obj.type === "prompt") {
+            process.stderr.write(
+              jsonl
+                ? "warning: invalid prompt control JSON, ignoring\n"
+                : "warning: ignoring prompt JSON (use --jsonl)\n",
+            );
+          } else {
+            process.stderr.write(
+              `warning: ignoring unknown control JSON type ${obj.type}\n`,
+            );
+          }
           return;
         }
       } catch {
@@ -266,6 +335,7 @@ export async function runStreamLoop(
       console.error("stream loop: quit received, exiting");
       shuttingDown = true;
       rejectAllPermissionWaiters("aborted");
+      rejectPendingStdinLine("aborted");
       promptQueue.close();
       rl.close();
       return;
@@ -277,6 +347,7 @@ export async function runStreamLoop(
   rl.on("close", () => {
     shuttingDown = true;
     rejectAllPermissionWaiters("aborted");
+    rejectPendingStdinLine("aborted");
     promptQueue.close();
   });
 
@@ -307,7 +378,10 @@ export async function runStreamLoop(
           verbose,
           permissionMode,
           jsonl,
-          waitPermissionReply,
+          waitPermissionReply:
+            permissionMode === "jsonl" ? waitPermissionReply : undefined,
+          readStdinLine:
+            permissionMode === "interactive" ? readStdinLine : undefined,
         });
       } catch (err: unknown) {
         if (userInitiatedAbort) {
@@ -320,6 +394,7 @@ export async function runStreamLoop(
       } finally {
         streamInFlight = false;
         rejectAllPermissionWaiters("aborted");
+        rejectPendingStdinLine("aborted");
       }
     }
   } finally {
@@ -330,6 +405,7 @@ export async function runStreamLoop(
     process.stdin.removeListener("end", onStdinEnd);
     process.stdin.removeListener("close", onStdinClose);
     rejectAllPermissionWaiters("aborted");
+    rejectPendingStdinLine("aborted");
     promptQueue.close();
     rl.close();
   }

@@ -173,7 +173,9 @@ With `--jsonl`, machine clients can use structured stdin/stdout:
 → {"type":"prompt","text":"explain","attachments":[{"name":"foo.ts","path":"/abs/foo.ts"}]}
 ```
 
-Attachments are **path-only** (no file body). Plain one-line prompts still work.
+File context is **path-only** (one-shot `ocd file.ts …` and stream attachments):
+`ocd` sends a path stub, not the file body, so the model reads/edits via tools.
+Plain one-line prompts still work.
 In a plain TTY `--stream` (no `--jsonl`), permissions use stderr prompts (`y`/`a`/`n`).
 
 | Flag | Meaning |
