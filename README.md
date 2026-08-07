@@ -9,7 +9,7 @@ CLI wrapper around the [OpenCode](https://github.com/sst/opencode) Agent SDK, pl
 
 | Tool | Why |
 |------|-----|
-| [Bun](https://bun.sh) | Run / build `ocd` |
+| [Bun](https://bun.sh) | Run `ocd` from source (`bun run`) |
 | [OpenCode](https://github.com/sst/opencode) CLI (`opencode` on `PATH`) | Daemon `opencode serve --pure` on `:4097` (auto-started by `ocd`) |
 | Emacs 27.1+ / [Spacemacs](https://www.spacemacs.org/) | Optional front-end (`opencode-chat.el`) |
 
@@ -38,9 +38,12 @@ cd ~/src/ocd-emacs
 bun install
 ```
 
-### 3. Install the `ocd` command
+### 3. Install the `ocd` command (wrapper only)
 
-**Option A — wrapper (recommended).** Avoids `bun --compile` dropping SDK methods:
+Use a thin shell wrapper that runs the TypeScript entry with Bun. **Do not use
+`bun build --compile` / `dist/ocd` for real work** — the bundler tree-shakes the
+OpenCode SDK client and drops methods such as `session.prompt` /
+`event.subscribe`, so streaming and prompts fail at runtime.
 
 ```bash
 mkdir -p ~/bin
@@ -53,17 +56,12 @@ EOF
 chmod +x ~/bin/ocd
 ```
 
-Add `~/bin` to `PATH` (e.g. in `~/.zshrc`: `export PATH="$HOME/bin:$PATH"`).
+Or from the repo: `./install.sh` (installs the same wrapper to `~/.local/bin/ocd`).
 
-**Option B — compiled binary:**
+Add `~/bin` (or `~/.local/bin`) to `PATH` (e.g. in `~/.zshrc`: `export PATH="$HOME/bin:$PATH"`).
 
-```bash
-bun run build          # → dist/ocd
-./install.sh           # → ~/.local/bin/ocd
-# ensure ~/.local/bin is on PATH
-```
-
-Cross-platform set: `bun run build:all` then `./install.sh` picks the matching `dist/ocd-*`.
+Ensure `which ocd` resolves to that wrapper — not an old compiled binary under
+`~/tools/ocd` or `dist/`.
 
 ### 4. Smoke-test the CLI
 
@@ -210,9 +208,10 @@ src/sessions.ts      Named session store (~/.ocd/sessions.json)
 src/context.ts       Workspace + prompt parts
 src/stream.ts        SSE streaming (+ optional JSONL)
 src/permissions.ts   Permission prompts
+src/errors.ts        SDK error formatting
 src/repl.ts          --stream read loop
 opencode-chat.el     Emacs major mode
-install.sh           Install dist binary to ~/.local/bin
+install.sh           Install bun-run wrapper to ~/.local/bin
 ```
 
 ## Development
@@ -221,6 +220,7 @@ install.sh           Install dist binary to ~/.local/bin
 bun install
 bunx tsc --noEmit
 bun run src/ocd.ts --help
+# Prefer bun run / the wrapper. Do not rely on bun build --compile.
 ```
 
 Agent-oriented notes: see [AGENTS.md](./AGENTS.md).

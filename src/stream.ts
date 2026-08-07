@@ -6,6 +6,7 @@ import {
   type PermissionMode,
   type WaitPermissionReply,
 } from "./permissions";
+import { formatSdkError } from "./errors";
 
 const STREAM_TIMEOUT_MS = 120_000;
 
@@ -92,7 +93,7 @@ export async function streamResponse(
         body: { parts },
       });
       if (result.error) {
-        throw new Error(String(result.error));
+        throw new Error(formatSdkError(result.error));
       }
       promptSent = true;
     } catch (err: unknown) {
@@ -407,7 +408,7 @@ async function batchPrompt(
     body: { parts },
   });
   if (result.error) {
-    throw new Error(`prompt failed: ${String(result.error)}`);
+    throw new Error(`prompt failed: ${formatSdkError(result.error)}`);
   }
   if (result.data) {
     for (const part of result.data.parts) {

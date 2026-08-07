@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import type { OpencodeClient } from "@opencode-ai/sdk";
+import { formatSdkError } from "./errors";
 
 export type PermissionMode = "interactive" | "auto" | "reject" | "jsonl";
 export type PermissionResponse = "once" | "always" | "reject";
@@ -177,7 +178,9 @@ export async function replyPermission(
     body: { response },
   });
   if (result.error) {
-    throw new Error(`permission reply failed: ${String(result.error)}`);
+    throw new Error(
+      `permission reply failed: ${formatSdkError(result.error)}`,
+    );
   }
 }
 

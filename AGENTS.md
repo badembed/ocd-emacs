@@ -55,8 +55,9 @@ Permission mode with `--jsonl` (unless `--auto`): stdin demux stays active durin
 
 ## Known limitations
 
-- `bun build --compile` may drop SDK methods; prefer `bun run src/ocd.ts` or a thin wrapper script.
-- Compiled binary size is large (~90MB+); that is expected for `--compile`.
+- **`bun build --compile` is broken for this project.** Tree-shaking drops OpenCode
+  SDK client methods (`session.prompt`, `event.subscribe`, …). Ship / document
+  only the `bun run src/ocd.ts` wrapper (`install.sh`). Do not recommend `dist/ocd`.
 
 ## Quality checks
 

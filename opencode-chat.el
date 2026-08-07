@@ -73,8 +73,6 @@ more verbose output (interpretation is implementation-defined)."
   :type '(choice integer (const :tag "Disabled" nil))
   :group 'opencode-chat)
 
-;;; Command stubs (real implementations land in todos 8-15).
-
 (defun opencode-chat--local-variables-start ()
   "Return the start of the trailing `Local Variables' block, or nil.
 A block counts only when nothing but whitespace follows its `;; End:'
@@ -439,7 +437,7 @@ When no subprocess is running, just kills the buffer (with the
 Lists session files in `opencode-chat-sessions-dir' and prompts with
 `completing-read' for one.  The selected session is opened via
 `find-file'; `opencode-chat-mode' auto-activates via `auto-mode-alist'
-and triggers `opencode-chat--restore-state' from todo 13, which
+and triggers `opencode-chat--restore-state', which
 resumes the subprocess and restores response-region text properties.
 
 Available via `M-x opencode-chat-resume' (no default keybinding).
@@ -478,8 +476,8 @@ Returns the buffer that was opened, or nil when no sessions exist."
 
 (defvar opencode-chat--session-name nil
   "Name of the OpenCode session backing this buffer.
-Set by callers (todo 11's `opencode-chat-open') or by file-local
-vars (todo 13's restore flow) BEFORE `opencode-chat-mode' activates.
+Set by callers (`opencode-chat-open') or by file-local vars
+(restore flow) BEFORE `opencode-chat-mode' activates.
 The mode's parent call (`text-mode') invokes `kill-all-local-variables',
 so `opencode-chat-mode' saves and restores this value around it.")
 (make-variable-buffer-local 'opencode-chat--session-name)
@@ -502,8 +500,7 @@ this alist is a snapshot rewritten from those properties on save.")
   "Non-nil while a prompt is in flight to the subprocess.
 Set to t by `opencode-chat-send'; cleared by the sentinel/filter
 when the response stream completes.  Currently used as a hook for
-visual feedback (e.g. mode-line indicators); future todos may add
-automatic clearing.")
+visual feedback (e.g. mode-line indicators).")
 (make-variable-buffer-local 'opencode-chat--sending)
 
 (defvar opencode-chat--prompt-marker nil
@@ -556,7 +553,7 @@ before our setup completes."
                     opencode-chat-major-mode
                   'fundamental-mode))
         ;; Save buffer-local vars that may have been set by
-        ;; file-local vars (todo 13) or by callers before the mode
+        ;; file-local vars or by callers before the mode
         ;; activates.  The parent mode's `kill-all-local-variables'
         ;; would wipe them, so save them now and restore after.
         ;; `file-local-variables-alist' is also saved because
@@ -885,7 +882,7 @@ When START equals END, inserts at point.  When START < END, deletes
 the region first.  Sets the `opencode-response' text property (with
 `front-sticky') on the inserted text and records the (BEG . END)
 pair in the buffer-local `opencode-chat--bounds' alist for
-persistence via file-local vars (todo 13).
+persistence via file-local vars.
 
 If the new region is adjacent to or overlaps the last recorded
 region in `opencode-chat--bounds', the last entry is extended
@@ -966,7 +963,7 @@ or exits abnormally.  Does NOT kill the buffer or close Emacs."
       (with-current-buffer buf
         (setq opencode-chat--process nil)))))
 
-;;; State persistence (todo 13).
+;;; State persistence.
 ;; File-local vars let `opencode-chat-mode' recover session state when
 ;; a session file is reopened.  `opencode-chat--save-state' writes the
 ;; vars via `add-file-local-variable' on save; `opencode-chat--restore-state'
@@ -1090,10 +1087,8 @@ a fresh, non-restored session)."
            (message "opencode-chat: failed to start subprocess: %S" err))))))))
 
 ;;; Session helpers.
-;; Internal functions used by `opencode-chat-open' (todo 11),
-;; `opencode-chat-rename-session' (todo 14), and `opencode-chat-resume'
-;; (todo 15).  None of these are user-facing, so they have no
-;; `;;;###autoload' cookie.
+;; Internal helpers for open / rename / resume.  None of these are
+;; user-facing, so they have no `;;;###autoload' cookie.
 
 (defun opencode-chat--ensure-sessions-dir ()
   "Return the expanded absolute path of `opencode-chat-sessions-dir'.
@@ -1171,18 +1166,14 @@ output is drained and the sentinel can fire."
       (setq ok (not (process-live-p proc)))
       ok)))
 
-;;; Open command (todo 11).
-;; Reuses `opencode-chat--ensure-sessions-dir' from the Session
-;; helpers section above (todo 12's spec was partially pre-implemented
-;; in this file; we don't redefine it here).
+;;; Open command.
 
 (defun opencode-chat--generate-anon-name ()
   "Generate a unique anonymous session name like `anon-<8-hex-chars>'.
-The hash input is `(user-uid) (emacs-pid) (float-time)' per todo 11's
-spec; an internal counter is mixed in to avoid collisions when the
-generated name already exists in `opencode-chat-sessions-dir'.
-Retries up to 16 times before giving up (which should never happen
-in practice)."
+Hash input is `(user-uid)', `(emacs-pid)', `(float-time)', plus an
+internal counter to avoid collisions when the name already exists in
+`opencode-chat-sessions-dir'.  Retries up to 16 times before giving up
+(which should never happen in practice)."
   (let ((dir (opencode-chat--ensure-sessions-dir))
         (counter 0)
         name)

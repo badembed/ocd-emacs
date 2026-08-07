@@ -9,6 +9,7 @@ import {
 import { homedir } from "node:os";
 import nodePath from "node:path";
 import type { OpencodeClient } from "@opencode-ai/sdk";
+import { formatSdkError } from "./errors";
 
 const SESSIONS_DIR = nodePath.join(homedir(), ".ocd");
 const SESSIONS_FILE = nodePath.join(SESSIONS_DIR, "sessions.json");
@@ -82,7 +83,7 @@ export async function resolveSession(
   });
   if (result.error) {
     throw new Error(
-      `failed to create session "${name}": ${String(result.error)}`,
+      `failed to create session "${name}": ${formatSdkError(result.error)}`,
     );
   }
   const id = result.data!.id;

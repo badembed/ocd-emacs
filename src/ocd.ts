@@ -10,6 +10,7 @@ import { assembleParts, resolveWorkspace } from "./context";
 import { streamResponse } from "./stream";
 import { resolvePermissionMode } from "./permissions";
 import { runStreamLoop } from "./repl";
+import { formatSdkError } from "./errors";
 
 const program = new Command();
 
@@ -150,7 +151,9 @@ async function main(): Promise<number> {
           question.length > 48 ? question.slice(0, 45) + "..." : question;
         const created = await client.session.create({ body: { title } });
         if (created.error) {
-          throw new Error(`failed to create session: ${String(created.error)}`);
+          throw new Error(
+            `failed to create session: ${formatSdkError(created.error)}`,
+          );
         }
         return created.data!.id;
       })();
