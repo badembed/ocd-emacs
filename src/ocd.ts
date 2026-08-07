@@ -9,6 +9,7 @@ import { resolveSession, listSessions } from "./sessions";
 import { assembleParts, resolveWorkspace } from "./context";
 import { streamResponse } from "./stream";
 import { resolvePermissionMode } from "./permissions";
+import { runStreamLoop } from "./repl";
 
 const program = new Command();
 
@@ -27,7 +28,12 @@ program
     "--auto",
     "auto-approve OpenCode permissions (once), like opencode run --auto",
   )
-  .option("-l, --list-sessions", "list named sessions");
+  .option("-l, --list-sessions", "list named sessions")
+  .option(
+    "--stream",
+    "read prompts from stdin, stream responses to stdout (multi-turn)",
+  )
+  .option("-n, --name <name>", "session name (required with --stream)");
 
 program.parse();
 
@@ -37,6 +43,8 @@ const opts = program.opts<{
   verbose?: boolean;
   auto?: boolean;
   listSessions?: boolean;
+  stream?: boolean;
+  name?: string;
 }>();
 const args: string[] = program.args;
 
@@ -54,8 +62,16 @@ function onSignal(code: number): void {
   process.exit(code);
 }
 
-process.on("SIGINT", () => onSignal(130));
-process.on("SIGTERM", () => onSignal(143));
+// Global signal handlers are registered only for non-stream modes. In
+// --stream mode, runStreamLoop installs its own SIGINT handler that aborts
+// the in-flight stream or closes readline cleanly; a second handler that
+// calls process.exit(130) would race it and kill the process before the
+// user can send the next prompt. SIGTERM in stream mode falls through to
+// Node's default (exit 143), which is appropriate for an external kill.
+if (!opts.stream) {
+  process.on("SIGINT", () => onSignal(130));
+  process.on("SIGTERM", () => onSignal(143));
+}
 
 async function main(): Promise<number> {
   // 1. --list-sessions takes precedence (cwd workspace)
@@ -65,7 +81,31 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  // 2. Disambiguate path vs question
+  // 2. --stream mode: stdin-driven multi-turn loop.
+  if (opts.stream) {
+    if (!opts.name) {
+      console.error("error: --name required with --stream");
+      return 1;
+    }
+    const client = await resolveClient(process.cwd());
+    const sessionID = await resolveSession(client, opts.name);
+    const verbose =
+      opts.verbose === true ||
+      process.env.OCD_VERBOSE === "1" ||
+      process.env.OCD_VERBOSE === "true";
+    const permissionMode = resolvePermissionMode({
+      autoFlag: opts.auto === true,
+    });
+    const controller = new AbortController();
+    await runStreamLoop(client, sessionID, {
+      signal: controller.signal,
+      verbose,
+      permissionMode,
+    });
+    return 0;
+  }
+
+  // 3. Disambiguate path vs question
   let path: string | undefined;
   let question: string | undefined;
 
@@ -79,20 +119,20 @@ async function main(): Promise<number> {
     program.help();
   }
 
-  // 3. Validate question before connecting
+  // 4. Validate question before connecting
   if (!question || question.trim().length === 0) {
     console.error("error: question required");
     return 1;
   }
 
-  // 4. Resolve workspace + assemble parts before spawning server
+  // 5. Resolve workspace + assemble parts before spawning server
   const workspace = resolveWorkspace(path);
   const parts = assembleParts(workspace.file, question, opts.paste === true);
 
-  // 5. Resolve client bound to the workspace directory
+  // 6. Resolve client bound to the workspace directory
   const client = await resolveClient(workspace.directory);
 
-  // 6. Resolve or create session.
+  // 7. Resolve or create session.
   // Always set a title on anonymous sessions so OpenCode skips the separate
   // title-agent LLM call (which frequently hangs on small models).
   const sessionID = opts.session
@@ -107,7 +147,7 @@ async function main(): Promise<number> {
         return created.data!.id;
       })();
 
-  // 7. Stream response
+  // 8. Stream response
   const verbose =
     opts.verbose === true ||
     process.env.OCD_VERBOSE === "1" ||
